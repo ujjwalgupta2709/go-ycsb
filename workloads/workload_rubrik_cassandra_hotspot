@@ -1,0 +1,43 @@
+# Rubrik Cassandra (cqlproxy) YCSB workload — RUN phase (HOTSPOT 80/20)
+# Issues mixed CQL queries against cqlproxy (port 27577).
+# Exercises full CAMS stack: cqlproxy translation + CockroachDB execution.
+#
+# Operation mix:
+#   75% SELECT (point lookup), 20% SCAN (range, 10-100 rows), 2% INSERT, 2% UPDATE, 1% DELETE
+#
+# Distribution: 80% of requests hit 20% of keys (Pareto principle)
+# This models a mix of hot active files/jobs with occasional cold data access.
+
+workload=core
+
+# Key space must match recordcount used in the load phase
+recordcount=15000000
+operationcount=50000000
+
+# 100 threads per node, run on each of the 4 nodes → ~2500 QPS/node → ~10000 QPS total
+threadcount=100
+target=2500
+
+# Operation mix matching production
+readproportion=0.75
+scanproportion=0.20
+insertproportion=0.02
+updateproportion=0.02
+deleteproportion=0.01
+
+# Hotspot: 80% of requests go to 20% of keys
+requestdistribution=hotspot
+hotspotdatafraction=0.20
+hotspotopnfraction=0.80
+
+# Scan size: uniform between 10 and 100 rows per scan
+maxscanlength=100
+minscanlength=10
+scanlengthdistribution=uniform
+
+measurementtype=histogram
+
+# cqlproxy connection (via gocql)
+cassandra.hosts=127.0.0.1
+cassandra.port=27577
+cassandra.load_mode=false

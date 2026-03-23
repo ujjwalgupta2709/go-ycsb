@@ -78,6 +78,10 @@ import (
 	_ "github.com/pingcap/go-ycsb/db/dynamodb"
 	// Register s3 database
 	_ "github.com/pingcap/go-ycsb/db/s3"
+	// Register Rubrik CockroachDB database (direct SQL)
+	_ "github.com/pingcap/go-ycsb/db/rubrik_cockroachdb"
+	// Register Rubrik Cassandra database (cqlproxy → CockroachDB)
+	_ "github.com/pingcap/go-ycsb/db/rubrik_cassandra"
 )
 
 var (
