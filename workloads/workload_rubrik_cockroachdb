@@ -3,10 +3,9 @@
 #   - 94.2% SELECT, 2.37% UPDATE, 2.36% INSERT, 1.02% DELETE
 #
 # Table weights (set in db.go):
-#   - sd.files        55%  (Atlas MDS header lookups)
-#   - sd.event        20%
-#   - sd.event_series 13%
-#   - sd.job_instance  8%
+#   - sd.files        60%  (Atlas MDS header lookups)
+#   - sd.event        22%
+#   - sd.event_series 14%
 #   - sd.report_stats  4%
 #
 # Target: ~2500 total QPS (285 existing steady-state + 2215 YCSB)

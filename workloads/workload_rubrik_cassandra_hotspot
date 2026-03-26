@@ -37,7 +37,7 @@ scanlengthdistribution=uniform
 
 measurementtype=histogram
 
-# cqlproxy connection (via gocql)
+# cqlproxy connection (raw CQL v4)
 cassandra.hosts=127.0.0.1
 cassandra.port=27577
 cassandra.load_mode=false

@@ -2,8 +2,8 @@
 # Issues mixed CQL queries against cqlproxy (port 27577).
 # Exercises full CAMS stack: cqlproxy translation + CockroachDB execution.
 #
-# LOW LOAD variant: targets 300 QPS additional on top of steady-state (~227 QPS).
-# Used to simulate P25-P50 CCES cluster traffic levels.
+# P50 LOAD variant: targets 500 QPS additional on top of steady-state (~227 QPS).
+# Used to simulate P50 CCES cluster traffic levels.
 #
 # Operation mix:
 #   75% SELECT (point lookup), 20% SCAN (range, 10-100 rows), 2% INSERT, 2% UPDATE, 1% DELETE
@@ -37,7 +37,7 @@ scanlengthdistribution=uniform
 
 measurementtype=histogram
 
-# cqlproxy connection (via gocql)
+# cqlproxy connection (raw CQL v4)
 cassandra.hosts=127.0.0.1
 cassandra.port=27577
 cassandra.load_mode=false

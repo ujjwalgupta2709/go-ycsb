@@ -4,8 +4,7 @@
 #
 # Table weights:
 #   - files         95%  → ~14,250,000 rows
-#   - job_instance   3%  →    ~450,000 rows
-#   - report_stats   2%  →    ~300,000 rows
+#   - report_stats   5%  →    ~750,000 rows
 
 workload=core
 
@@ -25,7 +24,7 @@ requestdistribution=uniform
 
 measurementtype=histogram
 
-# cqlproxy connection (via gocql)
-cassandra.hosts=10.49.1.186,10.49.1.187,10.49.1.192,10.49.1.194
+# cqlproxy connection (raw CQL v4)
+cassandra.hosts=127.0.0.1
 cassandra.port=27577
 cassandra.load_mode=true

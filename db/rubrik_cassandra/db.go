@@ -53,7 +53,7 @@ import (
 	"github.com/pingcap/go-ycsb/pkg/ycsb"
 )
 
-// ─── CQL v4 protocol constants ───────────────────────────────────────────────
+// CQL v4 protocol constants
 
 const (
 	cqlProtoVersion = byte(0x04) // CQL protocol v4 (request direction)
@@ -77,8 +77,6 @@ const (
 	//   version(1) + flags(1) + stream(2) + opcode(1) + length(4)
 	cqlFrameHeaderSize = 9
 )
-
-// ─── Minimal raw CQL v4 connection ───────────────────────────────────────────
 
 // minConn is a single TCP connection that speaks CQL v4.
 // It only supports QUERY frames (no PREPARE / EXECUTE).
@@ -248,8 +246,6 @@ func parseCQLError(body []byte) error {
 	return fmt.Errorf("CQL error 0x%04x: %s", code, msg)
 }
 
-// ─── Query statistics ────────────────────────────────────────────────────────
-
 type queryStats struct {
 	total      atomic.Int64
 	success    atomic.Int64
@@ -308,8 +304,6 @@ func (s *queryStats) stop() {
 	close(s.stopCh)
 }
 
-// ─── Driver config keys ───────────────────────────────────────────────────────
-
 const (
 	cassandraHosts            = "cassandra.hosts"
 	cassandraPort             = "cassandra.port"
@@ -319,8 +313,6 @@ const (
 	cassandraPassword         = "cassandra.password"
 )
 
-// ─── Table names ──────────────────────────────────────────────────────────────
-
 // sd.event and sd.event_series are native SQL tables in CockroachDB —
 // cqlproxy rejects CQL queries against them with "cannot run queries on
 // native SQL table". Only the three CQL-managed tables are accessible.
@@ -329,22 +321,18 @@ const (
 	tableReportStats = "report_stats"
 )
 
-// ─── Table routing weights ────────────────────────────────────────────────────
-
 type tableWeight struct {
 	name      string
 	threshold float64 // cumulative upper bound in [0,1)
 }
 
 // runWeights: files=89%, report_stats=11%
-// (Proportionally rescaled after removing job_instance.)
 var runWeights = []tableWeight{
 	{tableFiles, 0.89},
 	{tableReportStats, 1.00},
 }
 
 // loadWeights: files=95%, report_stats=5%
-// (Proportionally rescaled after removing job_instance.)
 var loadWeights = []tableWeight{
 	{tableFiles, 0.95},
 	{tableReportStats, 1.00},
@@ -365,8 +353,6 @@ func pickTable(rng *rand.Rand, weights []tableWeight) string {
 func cqlStr(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
-
-// ─── Production-realistic data generators ─────────────────────────────────────
 
 func randHex16(rng *rand.Rand) string {
 	var buf [8]byte
@@ -438,8 +424,6 @@ func genChildMap(rng *rand.Rand) []byte {
 	return buf
 }
 
-// ─── Driver structs ───────────────────────────────────────────────────────────
-
 type cassandraCreator struct{}
 
 func init() { ycsb.RegisterDBCreator("rubrik_cassandra", cassandraCreator{}) }
@@ -478,8 +462,6 @@ func (s *cassandraState) nextStream() int16 {
 	}
 	return s.stream
 }
-
-// ─── Creator ──────────────────────────────────────────────────────────────────
 
 func (c cassandraCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	hostsStr := p.GetString(cassandraHosts, "127.0.0.1")
@@ -606,8 +588,6 @@ func (db *cassandraDB) CleanupThread(ctx context.Context) {
 	}
 }
 
-// ─── Core query executor ─────────────────────────────────────────────────────
-
 func (db *cassandraDB) runCQL(s *cassandraState, q string) error {
 	if s.conn == nil {
 		return fmt.Errorf("no cqlproxy connection for this thread")
@@ -623,8 +603,6 @@ func (db *cassandraDB) runCQL(s *cassandraState, q string) error {
 	}
 	return err
 }
-
-// ─── effectiveLoadWeights ────────────────────────────────────────────────────
 
 func (db *cassandraDB) effectiveLoadWeights() []tableWeight {
 	if db.loadTargetTables == nil {
@@ -656,8 +634,6 @@ func (db *cassandraDB) effectiveLoadWeights() []tableWeight {
 	return result
 }
 
-// ─── Read (75%) ───────────────────────────────────────────────────────────────
-
 func (db *cassandraDB) Read(ctx context.Context, _ string, key string, _ []string) (map[string][]byte, error) {
 	s := ctx.Value(stateKey).(*cassandraState)
 	s.hll.Insert([]byte(key))
@@ -675,8 +651,6 @@ func (db *cassandraDB) Read(ctx context.Context, _ string, key string, _ []strin
 	return map[string][]byte{"key": []byte(key)}, nil
 }
 
-// ─── Scan (20%) ───────────────────────────────────────────────────────────────
-
 func (db *cassandraDB) Scan(ctx context.Context, _ string, startKey string, count int, _ []string) ([]map[string][]byte, error) {
 	s := ctx.Value(stateKey).(*cassandraState)
 	if count <= 0 {
@@ -693,8 +667,6 @@ func (db *cassandraDB) Scan(ctx context.Context, _ string, startKey string, coun
 	return nil, nil // rows discarded — we care about QPS/latency, not data
 }
 
-// ─── Update (2%) ──────────────────────────────────────────────────────────────
-
 func (db *cassandraDB) Update(ctx context.Context, _ string, key string, _ map[string][]byte) error {
 	s := ctx.Value(stateKey).(*cassandraState)
 	// All updates route to files (report_stats PK includes creation_time, making updates impractical).
@@ -704,8 +676,6 @@ func (db *cassandraDB) Update(ctx context.Context, _ string, key string, _ map[s
 	)
 	return db.runCQL(s, q)
 }
-
-// ─── Insert (2% run / 100% load) ─────────────────────────────────────────────
 
 func (db *cassandraDB) Insert(ctx context.Context, _ string, key string, _ map[string][]byte) error {
 	s := ctx.Value(stateKey).(*cassandraState)
@@ -776,11 +746,8 @@ func (db *cassandraDB) insertReportStats(s *cassandraState, key string) error {
 	return db.runCQL(s, q)
 }
 
-// ─── Delete (1%) ──────────────────────────────────────────────────────────────
-
 func (db *cassandraDB) Delete(ctx context.Context, _ string, key string) error {
 	s := ctx.Value(stateKey).(*cassandraState)
-	// All cases route to files delete (job_instance/report_stats deletes are unsafe).
 	q := fmt.Sprintf(`DELETE FROM sd.files WHERE uuid = %s AND stripe_id = -1`, cqlStr(key))
 	return db.runCQL(s, q)
 }

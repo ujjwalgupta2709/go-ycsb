@@ -54,7 +54,7 @@ const (
 	crdbDBName            = "crdb.db"
 	crdbSSLMode           = "crdb.sslmode"
 	crdbLoadMode          = "crdb.load_mode"          // bool: true = load phase, false = run phase
-	crdbLoadTargetTables  = "crdb.load_target_tables" // comma-separated e.g. "sd.event,sd.job_instance"; empty = all tables
+	crdbLoadTargetTables  = "crdb.load_target_tables" // comma-separated e.g. "sd.event,sd.report_stats"; empty = all tables
 )
 
 // table name constants
@@ -72,7 +72,6 @@ type tableWeight struct {
 }
 
 // runWeights: files=60%, event=22%, event_series=14%, report_stats=4%
-// (Proportionally rescaled after removing job_instance.)
 var runWeights = []tableWeight{
 	{tableFiles, 0.60},
 	{tableEvent, 0.82},
@@ -81,7 +80,6 @@ var runWeights = []tableWeight{
 }
 
 // loadWeights: files=82%, event=12%, event_series=4%, report_stats=2%
-// (Proportionally rescaled after removing job_instance.)
 var loadWeights = []tableWeight{
 	{tableFiles, 0.82},
 	{tableEvent, 0.94},
@@ -89,8 +87,8 @@ var loadWeights = []tableWeight{
 	{tableReportStats, 1.00},
 }
 
-func pickTable(weights []tableWeight) string {
-	r := rand.Float64()
+func pickTable(rng *rand.Rand, weights []tableWeight) string {
+	r := rng.Float64()
 	for _, w := range weights {
 		if r < w.threshold {
 			return w.name
@@ -146,8 +144,6 @@ func derivedTime(key string) string {
 	epoch := int64(murmur3.Sum32([]byte(key))) % int64(365*24*3600)
 	return time.Unix(epoch, 0).UTC().Format(time.RFC3339)
 }
-
-// ─── sd.files row generators (production-realistic payloads) ─────────────────
 
 // randHex16 returns a 16-character lowercase hex string (8 random bytes).
 func randHex16(rng *rand.Rand) string {
@@ -452,13 +448,9 @@ func (db *cockroachDB) querySingleRow(ctx context.Context, query string, args ..
 	return m, rows.Err()
 }
 
-// --------------------------------------------------------------------------
-// Read — 97.1% of operations
-// --------------------------------------------------------------------------
-
 func (db *cockroachDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
 	state := ctx.Value(stateKey).(*cockroachState)
-	switch pickTable(runWeights) {
+	switch pickTable(state.rng, runWeights) {
 	case tableFiles:
 		return db.readFiles(ctx, key)
 	case tableEvent:
@@ -490,21 +482,13 @@ func (db *cockroachDB) readReportStats(ctx context.Context, key string) (map[str
 	return db.querySingleRow(ctx, query, hashToken(key), key)
 }
 
-// --------------------------------------------------------------------------
-// Scan — disabled in workload (scanproportion=0)
-// --------------------------------------------------------------------------
-
 func (db *cockroachDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
 	return nil, nil
 }
 
-// --------------------------------------------------------------------------
-// Update — 0.94% of operations
-// --------------------------------------------------------------------------
-
 func (db *cockroachDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
 	state := ctx.Value(stateKey).(*cockroachState)
-	switch pickTable(runWeights) {
+	switch pickTable(state.rng, runWeights) {
 	case tableFiles:
 		query := `UPDATE sd.files SET open_heartbeat_time = $1 WHERE token__uuid = $2 AND uuid = $3 AND stripe_id = -1`
 		return db.execQuery(ctx, query, time.Now().UnixNano(), hashToken(key), key)
@@ -524,17 +508,13 @@ func (db *cockroachDB) Update(ctx context.Context, table string, key string, val
 	}
 }
 
-// --------------------------------------------------------------------------
-// Insert — 1.77% of operations (run phase) / 100% of operations (load phase)
-// --------------------------------------------------------------------------
-
 func (db *cockroachDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
 	state := ctx.Value(stateKey).(*cockroachState)
 	weights := runWeights
 	if db.loadMode {
 		weights = db.effectiveLoadWeights()
 	}
-	switch pickTable(weights) {
+	switch pickTable(state.rng, weights) {
 	case tableFiles:
 		return db.insertFiles(ctx, key, state.rng)
 	case tableEvent:
@@ -838,13 +818,9 @@ func (db *cockroachDB) insertReportStats(ctx context.Context, key string, rng *r
 	)
 }
 
-// --------------------------------------------------------------------------
-// Delete — 0.20% of operations
-// --------------------------------------------------------------------------
-
 func (db *cockroachDB) Delete(ctx context.Context, table string, key string) error {
 	state := ctx.Value(stateKey).(*cockroachState)
-	switch pickTable(runWeights) {
+	switch pickTable(state.rng, runWeights) {
 	case tableFiles:
 		query := `DELETE FROM sd.files WHERE token__uuid = $1 AND uuid = $2 AND stripe_id = -1`
 		return db.execQuery(ctx, query, hashToken(key), key)
@@ -855,8 +831,8 @@ func (db *cockroachDB) Delete(ctx context.Context, table string, key string) err
 		query := `DELETE FROM sd.event_series WHERE organization_id = $1 AND event_series_id = $2`
 		return db.execQuery(ctx, query, orgIDs[state.rng.Intn(len(orgIDs))], key)
 	default:
-		query := `DELETE FROM sd.event WHERE event_id = $1`
-		return db.execQuery(ctx, query, key)
+		query := `DELETE FROM sd.report_stats WHERE token__month_object_id = $1 AND month_object_id = $2 AND creation_time = $3`
+		return db.execQuery(ctx, query, hashToken(key), key, derivedTime(key))
 	}
 }
 
