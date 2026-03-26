@@ -21,7 +21,7 @@ require (
 	github.com/go-ini/ini v1.49.0 // indirect
 	github.com/go-redis/redis/v9 v9.0.0-rc.1
 	github.com/go-sql-driver/mysql v1.6.0
-	github.com/gocql/gocql v0.0.0-20181124151448-70385f88b28b // replaced by scaledata/gocql below
+	github.com/gocql/gocql v1.6.0
 	github.com/lib/pq v1.1.1
 	github.com/magiconair/properties v1.8.0
 	github.com/mattn/go-sqlite3 v2.0.1+incompatible
@@ -158,6 +158,6 @@ require (
 
 replace github.com/apache/thrift => github.com/apache/thrift v0.0.0-20171203172758-327ebb6c2b6d
 
-replace github.com/gocql/gocql => github.com/scaledata/gocql v0.0.0-20260204120934-55dceabe0e6d
+// replace github.com/gocql/gocql => github.com/scaledata/gocql v0.0.0-20260204120934-55dceabe0e6d
 
 go 1.24.7

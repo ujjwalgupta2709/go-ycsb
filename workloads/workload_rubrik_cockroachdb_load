@@ -2,21 +2,19 @@
 # Pre-populates tables before the run phase so reads are not wasted.
 #
 # Table weights (set in db.go when crdb.load_mode=true):
-#   - sd.files        80%  → ~12,000,000 rows
-#   - sd.event        12%  →  ~1,800,000 rows
-#   - sd.event_series  4%  →    ~600,000 rows
-#   - sd.job_instance  2.5%→    ~375,000 rows
-#   - sd.report_stats  1.5%→    ~225,000 rows
+#   - sd.files        82%  → ~24,600,000 rows
+#   - sd.event        12%  →  ~3,600,000 rows
+#   - sd.event_series  4%  →  ~1,200,000 rows
+#   - sd.report_stats  2%  →    ~600,000 rows
 #
-# Designed for a 4-node Azure CCES cluster (halved from 8-node estimates).
 
 workload=core
 
-recordcount=15000000
-operationcount=15000000
+recordcount=30000000
+operationcount=30000000
 
 # No QPS cap during load; use more threads for throughput
-threadcount=200
+threadcount=100
 
 # Pure insert, uniform distribution across key space
 readproportion=0
@@ -29,7 +27,7 @@ requestdistribution=uniform
 measurementtype=histogram
 
 # CockroachDB connection settings
-crdb.hosts=10.49.1.186,10.49.1.187,10.49.1.192,10.49.1.194
+crdb.hosts=127.0.0.1
 crdb.port=26257
 crdb.user=root
 crdb.password=

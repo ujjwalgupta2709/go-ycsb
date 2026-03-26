@@ -16,26 +16,29 @@
 // CockroachDB. This exercises the full CAMS stack instead of bypassing
 // cqlproxy and hitting CockroachDB directly.
 //
-// Uses scaledata/gocql (Rubrik's gocql fork) with SkipPrepStmt=true so that
-// QUERY frames are sent directly (no PREPARE + EXECUTE), matching the pattern
-// required by cqlproxy.
+// Uses a minimal raw CQL v4 QUERY-frame client (no gocql) because upstream
+// gocql always sends PREPARE + EXECUTE, but cqlproxy returns a dummy empty
+// RESULT to PREPARE, which gocql cannot parse. The raw client sends QUERY
+// frames directly, matching the pattern used by Rubrik's own scaledata/gocql
+// fork (SkipPrepStmt=true).
 //
 // Tables and operation mix:
 //
-//	Run weights:  files=82%, job_instance=12%, report_stats=6%
-//	Load weights: files=95%, job_instance=3%, report_stats=2%
+//	Run weights:  files=89%, report_stats=11%
+//	Load weights: files=95%, report_stats=5%
 //	Op mix:       75% SELECT (point lookup), 20% SCAN (range), 2% INSERT, 2% UPDATE, 1% DELETE
 //
-// Scan routing (across 2 table patterns):
+// Scan routing:
 //
-//	63% job_instance — token range scan (JFL job discovery pattern)
-//	37% files        — clustering key range scan (MDS all-stripes-for-a-file pattern)
+//	100% files — clustering key range scan (MDS all-stripes-for-a-file pattern)
 package rubrik_cassandra
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
-	"log"
+	"io"
 	"math/rand"
 	"net"
 	"os"
@@ -48,46 +51,209 @@ import (
 	"github.com/magiconair/properties"
 	"github.com/pingcap/go-ycsb/pkg/prop"
 	"github.com/pingcap/go-ycsb/pkg/ycsb"
-	"github.com/gocql/gocql"
 )
 
-// ─── gocql helpers (from Swapnil's fork) ──────────────────────────────────────
+// ─── CQL v4 protocol constants ───────────────────────────────────────────────
 
-// ProxyAddressTranslator redirects all discovered Cassandra node addresses
-// to the cqlproxy address(es). Without this, gocql would try to connect
-// directly to the Cassandra nodes (e.g. 127.0.0.1) instead of the proxy.
-type ProxyAddressTranslator struct {
-	proxyAddr net.IP
-	proxyPort int
+const (
+	cqlProtoVersion = byte(0x04) // CQL protocol v4 (request direction)
+
+	// Opcodes (request)
+	cqlOpStartup      = byte(0x01)
+	cqlOpQuery        = byte(0x07)
+	cqlOpAuthResponse = byte(0x0F)
+
+	// Opcodes (response)
+	cqlOpReady        = byte(0x02)
+	cqlOpAuthenticate = byte(0x03)
+	cqlOpResult       = byte(0x08)
+	cqlOpError        = byte(0x00)
+	cqlOpAuthSuccess  = byte(0x10)
+
+	// Consistency: LOCAL_ONE
+	cqlConsistencyLocalOne = uint16(10)
+
+	// CQL v4 frame header is always 9 bytes:
+	//   version(1) + flags(1) + stream(2) + opcode(1) + length(4)
+	cqlFrameHeaderSize = 9
+)
+
+// ─── Minimal raw CQL v4 connection ───────────────────────────────────────────
+
+// minConn is a single TCP connection that speaks CQL v4.
+// It only supports QUERY frames (no PREPARE / EXECUTE).
+// Not safe for concurrent use — each YCSB worker thread gets its own minConn.
+type minConn struct {
+	conn net.Conn
 }
 
-func (t *ProxyAddressTranslator) Translate(addr net.IP, port int) (net.IP, int) {
-	return t.proxyAddr, t.proxyPort
+func dialMinConn(host string, port int, username, password string) (*minConn, error) {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	c, err := net.DialTimeout("tcp", addr, 15*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("dial cqlproxy %s: %w", addr, err)
+	}
+	mc := &minConn{conn: c}
+	if err := mc.startup(username, password); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("cqlproxy startup at %s: %w", addr, err)
+	}
+	return mc, nil
 }
 
-// tolerantConvictionPolicy never marks a host as down. Since cqlproxy fronts
-// multiple CockroachDB pods behind a single address, convicting the proxy
-// host would be fatal.
-type tolerantConvictionPolicy struct{}
+func (mc *minConn) close() { mc.conn.Close() }
 
-func (p *tolerantConvictionPolicy) AddFailure(err error, host *gocql.HostInfo) bool { return false }
-func (p *tolerantConvictionPolicy) Reset(host *gocql.HostInfo)                      {}
+// buildFrame constructs a CQL v4 request frame.
+func buildFrame(opcode byte, stream int16, body []byte) []byte {
+	buf := make([]byte, cqlFrameHeaderSize+len(body))
+	buf[0] = cqlProtoVersion
+	buf[1] = 0x00 // flags
+	buf[2] = byte(stream >> 8)
+	buf[3] = byte(stream)
+	buf[4] = opcode
+	binary.BigEndian.PutUint32(buf[5:9], uint32(len(body)))
+	copy(buf[9:], body)
+	return buf
+}
 
-// gocqlLogger implements gocql.StdLogger for verbose CQL logging.
-type gocqlLogger struct{}
+// appendString appends [short len][bytes] (CQL "string" type) to buf.
+func appendString(buf []byte, s string) []byte {
+	l := len(s)
+	buf = append(buf, byte(l>>8), byte(l))
+	return append(buf, s...)
+}
 
-func (l gocqlLogger) Print(v ...interface{})                 { log.Print(v...) }
-func (l gocqlLogger) Printf(format string, v ...interface{}) { log.Printf(format, v...) }
-func (l gocqlLogger) Println(v ...interface{})               { log.Println(v...) }
+// appendLongString appends [int len][bytes] (CQL "long string" type) to buf.
+func appendLongString(buf []byte, s string) []byte {
+	l := len(s)
+	buf = append(buf, byte(l>>24), byte(l>>16), byte(l>>8), byte(l))
+	return append(buf, s...)
+}
 
-// ─── Query statistics (from Swapnil's fork) ───────────────────────────────────
+// startup performs the STARTUP → READY/AUTHENTICATE handshake.
+// If the server requires authentication, sends AUTH_RESPONSE with credentials.
+func (mc *minConn) startup(username, password string) error {
+	// Encode string map: {"CQL_VERSION": "3.4.0"}
+	var body []byte
+	body = append(body, 0x00, 0x01) // [short] 1 entry
+	body = appendString(body, "CQL_VERSION")
+	body = appendString(body, "3.4.0")
+
+	if _, err := mc.conn.Write(buildFrame(cqlOpStartup, 1, body)); err != nil {
+		return err
+	}
+	opcode, _, err := mc.readFrame()
+	if err != nil {
+		return err
+	}
+	if opcode == cqlOpReady {
+		return nil
+	}
+	if opcode == cqlOpAuthenticate {
+		return mc.authenticate(username, password)
+	}
+	return fmt.Errorf("expected READY (0x%02x) or AUTHENTICATE (0x%02x), got 0x%02x",
+		cqlOpReady, cqlOpAuthenticate, opcode)
+}
+
+// authenticate sends AUTH_RESPONSE with SASL PLAIN credentials: \0username\0password
+func (mc *minConn) authenticate(username, password string) error {
+	// SASL PLAIN: \0username\0password
+	token := make([]byte, 0, 2+len(username)+len(password))
+	token = append(token, 0x00)
+	token = append(token, []byte(username)...)
+	token = append(token, 0x00)
+	token = append(token, []byte(password)...)
+
+	// AUTH_RESPONSE body: [int len][bytes token]
+	var body []byte
+	l := len(token)
+	body = append(body, byte(l>>24), byte(l>>16), byte(l>>8), byte(l))
+	body = append(body, token...)
+
+	if _, err := mc.conn.Write(buildFrame(cqlOpAuthResponse, 1, body)); err != nil {
+		return err
+	}
+	opcode, respBody, err := mc.readFrame()
+	if err != nil {
+		return err
+	}
+	if opcode == cqlOpAuthSuccess || opcode == cqlOpReady {
+		return nil
+	}
+	if opcode == cqlOpError {
+		return parseCQLError(respBody)
+	}
+	return fmt.Errorf("auth: expected AUTH_SUCCESS (0x%02x), got 0x%02x", cqlOpAuthSuccess, opcode)
+}
+
+// readFrame reads one CQL v4 response frame and returns (opcode, body, error).
+func (mc *minConn) readFrame() (byte, []byte, error) {
+	var hdr [cqlFrameHeaderSize]byte
+	if _, err := io.ReadFull(mc.conn, hdr[:]); err != nil {
+		return 0, nil, fmt.Errorf("read frame header: %w", err)
+	}
+	opcode := hdr[4]
+	bodyLen := int(binary.BigEndian.Uint32(hdr[5:9]))
+	if bodyLen < 0 || bodyLen > 32*1024*1024 {
+		return 0, nil, fmt.Errorf("implausible frame body length %d", bodyLen)
+	}
+	body := make([]byte, bodyLen)
+	if bodyLen > 0 {
+		if _, err := io.ReadFull(mc.conn, body); err != nil {
+			return 0, nil, fmt.Errorf("read frame body: %w", err)
+		}
+	}
+	return opcode, body, nil
+}
+
+// execQuery sends a CQL QUERY frame for the given statement and reads the
+// response. On an ERROR opcode it returns the server's error message.
+func (mc *minConn) execQuery(stream int16, q string) error {
+	// Body: [long string] query + [short] consistency + [byte] flags=0
+	var body []byte
+	body = appendLongString(body, q)
+	body = append(body, byte(cqlConsistencyLocalOne>>8), byte(cqlConsistencyLocalOne))
+	body = append(body, 0x00) // flags = 0 (no bound values, no paging, etc.)
+
+	if _, err := mc.conn.Write(buildFrame(cqlOpQuery, stream, body)); err != nil {
+		return err
+	}
+	opcode, respBody, err := mc.readFrame()
+	if err != nil {
+		return err
+	}
+	if opcode == cqlOpError {
+		return parseCQLError(respBody)
+	}
+	if opcode != cqlOpResult {
+		return fmt.Errorf("unexpected CQL opcode 0x%02x", opcode)
+	}
+	return nil
+}
+
+// parseCQLError decodes a CQL v4 ERROR body: [int] code + [string] message.
+func parseCQLError(body []byte) error {
+	if len(body) < 4 {
+		return fmt.Errorf("CQL ERROR (truncated body)")
+	}
+	code := binary.BigEndian.Uint32(body[0:4])
+	msg := ""
+	if len(body) >= 6 {
+		msgLen := int(binary.BigEndian.Uint16(body[4:6]))
+		if len(body) >= 6+msgLen {
+			msg = string(body[6 : 6+msgLen])
+		}
+	}
+	return fmt.Errorf("CQL error 0x%04x: %s", code, msg)
+}
+
+// ─── Query statistics ────────────────────────────────────────────────────────
 
 type queryStats struct {
 	total      atomic.Int64
 	success    atomic.Int64
 	failed     atomic.Int64
-	noHosts    atomic.Int64
-	timeouts   atomic.Int64
 	totalLatNs atomic.Int64
 	maxLatNs   atomic.Int64
 	stopCh     chan struct{}
@@ -101,7 +267,6 @@ func (s *queryStats) record(dur time.Duration, err error) {
 	ns := dur.Nanoseconds()
 	s.total.Add(1)
 	s.totalLatNs.Add(ns)
-	// Update max atomically (CAS loop).
 	for {
 		cur := s.maxLatNs.Load()
 		if ns <= cur || s.maxLatNs.CompareAndSwap(cur, ns) {
@@ -113,13 +278,6 @@ func (s *queryStats) record(dur time.Duration, err error) {
 		return
 	}
 	s.failed.Add(1)
-	errMsg := err.Error()
-	if strings.Contains(errMsg, "no hosts available") {
-		s.noHosts.Add(1)
-	}
-	if strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "i/o timeout") {
-		s.timeouts.Add(1)
-	}
 }
 
 func (s *queryStats) startReporter(interval time.Duration) {
@@ -136,9 +294,8 @@ func (s *queryStats) startReporter(interval time.Duration) {
 				avgMs := float64(s.totalLatNs.Load()) / float64(total) / 1e6
 				maxMs := float64(s.maxLatNs.Load()) / 1e6
 				fmt.Fprintf(os.Stderr,
-					"[STATS] total=%d ok=%d fail=%d no_hosts=%d timeouts=%d avg_ms=%.1f max_ms=%.1f\n",
-					total, s.success.Load(), s.failed.Load(),
-					s.noHosts.Load(), s.timeouts.Load(), avgMs, maxMs,
+					"[STATS] total=%d ok=%d fail=%d avg_ms=%.1f max_ms=%.1f\n",
+					total, s.success.Load(), s.failed.Load(), avgMs, maxMs,
 				)
 			case <-s.stopCh:
 				return
@@ -158,10 +315,8 @@ const (
 	cassandraPort             = "cassandra.port"
 	cassandraLoadMode         = "cassandra.load_mode"
 	cassandraLoadTargetTables = "cassandra.load_target_tables"
-	cassandraDebug            = "cassandra.debug"
-	cassandraTimeout          = "cassandra.timeout"
-	cassandraConnectTimeout   = "cassandra.connect_timeout"
-	cassandraNumConns         = "cassandra.num_conns"
+	cassandraUsername         = "cassandra.username"
+	cassandraPassword         = "cassandra.password"
 )
 
 // ─── Table names ──────────────────────────────────────────────────────────────
@@ -171,7 +326,6 @@ const (
 // native SQL table". Only the three CQL-managed tables are accessible.
 const (
 	tableFiles       = "files"
-	tableJobInstance = "job_instance"
 	tableReportStats = "report_stats"
 )
 
@@ -182,24 +336,18 @@ type tableWeight struct {
 	threshold float64 // cumulative upper bound in [0,1)
 }
 
-// runWeights: files=82%, job_instance=12%, report_stats=6%
+// runWeights: files=89%, report_stats=11%
+// (Proportionally rescaled after removing job_instance.)
 var runWeights = []tableWeight{
-	{tableFiles, 0.82},
-	{tableJobInstance, 0.94},
+	{tableFiles, 0.89},
 	{tableReportStats, 1.00},
 }
 
-// loadWeights: files=95%, job_instance=3%, report_stats=2%
+// loadWeights: files=95%, report_stats=5%
+// (Proportionally rescaled after removing job_instance.)
 var loadWeights = []tableWeight{
 	{tableFiles, 0.95},
-	{tableJobInstance, 0.98},
 	{tableReportStats, 1.00},
-}
-
-// scanWeights: job_instance=63%, files=37%
-var scanWeights = []tableWeight{
-	{tableJobInstance, 0.63},
-	{tableFiles, 1.00},
 }
 
 func pickTable(rng *rand.Rand, weights []tableWeight) string {
@@ -218,13 +366,76 @@ func cqlStr(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
-// noPrepare prefixes a CQL statement with a block comment so that gocql's
-// shouldPrepare() logic (which checks the first word) sees "/*" instead of
-// a DML keyword and sends a raw QUERY frame rather than PREPARE + EXECUTE.
-// cqlproxy does not handle EXECUTE opcodes, so all queries must be sent as
-// QUERY frames. The comment is transparent to the CQL parser.
-func noPrepare(q string) string {
-	return "/* */ " + q
+// ─── Production-realistic data generators ─────────────────────────────────────
+
+func randHex16(rng *rand.Rand) string {
+	var buf [8]byte
+	for i := range buf {
+		buf[i] = byte(rng.Intn(256))
+	}
+	return hex.EncodeToString(buf[:])
+}
+
+func randUUID4(rng *rand.Rand) string {
+	var u [16]byte
+	for i := range u {
+		u[i] = byte(rng.Intn(256))
+	}
+	u[6] = (u[6] & 0x0f) | 0x40
+	u[8] = (u[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
+}
+
+func genDirectorySpec(rng *rand.Rand) string {
+	sdfsUUID := randUUID4(rng)
+	numStripes := 1 + rng.Intn(3)
+	version := 1 + rng.Intn(2)
+	chunkSize := 67108864
+	return fmt.Sprintf(
+		`{"1":{"i32":%d},"2":{"lst":["str",0]},"3":{"rec":{"1":{"i32":1},"2":{"i32":%d},"3":{"i32":%d},"4":{"i32":%d},"5":{"i32":0},"6":{"i32":0},"7":{"i32":0},"8":{"i32":%d},"9":{"lst":["str",1,"%s"]}}},"4":{"tf":%d},"5":{"str":""},"6":{"tf":0},"7":{"i64":0},"8":{"map":["str","rec",0,{}]},"9":{"str":""},"10":{"tf":1},"12":{"tf":0},"13":{"tf":0},"14":{"rec":{"1":{"tf":0},"2":{"i64":0}}},"15":{"tf":1}}`,
+		1+rng.Intn(3), numStripes, version, chunkSize, rng.Intn(5), sdfsUUID, rng.Intn(2),
+	)
+}
+
+func genParentMap(rng *rand.Rand, parentHint string) string {
+	names := []string{
+		fmt.Sprintf("data_%d.avro", rng.Intn(100)),
+		randHex16(rng),
+		fmt.Sprintf("%s_%s", randUUID4(rng), randUUID4(rng)),
+	}
+	name := names[rng.Intn(len(names))]
+	entryType := 1 + rng.Intn(2)
+	return fmt.Sprintf(
+		`{"1":{"map":["str","map",1,{"%s":["str","i32",1,{"%s":%d}]}]}}`,
+		parentHint, name, entryType,
+	)
+}
+
+// cqlHexBlob formats a byte slice as a CQL hex blob literal (0x...).
+// Returns "null" for nil slices.
+func cqlHexBlob(b []byte) string {
+	if b == nil {
+		return "null"
+	}
+	return "0x" + hex.EncodeToString(b)
+}
+
+func genChildMap(rng *rand.Rand) []byte {
+	r := rng.Float64()
+	if r < 0.60 {
+		return nil
+	}
+	if r < 0.70 {
+		return []byte{0x00, 0x00, 0x00, 0x00}
+	}
+	numEntries := 1 + rng.Intn(5)
+	size := 4 + numEntries*((16+4+16+4)*2)
+	buf := make([]byte, size)
+	buf[0], buf[1], buf[2], buf[3] = 0x00, 0x00, 0x00, byte(numEntries)
+	for i := 4; i < len(buf); i++ {
+		buf[i] = byte(rng.Intn(256))
+	}
+	return buf
 }
 
 // ─── Driver structs ───────────────────────────────────────────────────────────
@@ -234,7 +445,10 @@ type cassandraCreator struct{}
 func init() { ycsb.RegisterDBCreator("rubrik_cassandra", cassandraCreator{}) }
 
 type cassandraDB struct {
-	session          *gocql.Session
+	hosts            []string
+	port             int
+	username         string
+	password         string
 	verbose          bool
 	loadMode         bool
 	loadTargetTables map[string]bool // nil = all tables
@@ -250,9 +464,19 @@ const stateKey = contextKey("cassandraDB")
 
 type cassandraState struct {
 	rng      *rand.Rand
+	conn     *minConn
+	stream   int16
 	hll      *hyperloglog.Sketch
 	threadID int
 	ops      int64
+}
+
+func (s *cassandraState) nextStream() int16 {
+	s.stream++
+	if s.stream <= 0 {
+		s.stream = 1
+	}
+	return s.stream
 }
 
 // ─── Creator ──────────────────────────────────────────────────────────────────
@@ -270,48 +494,14 @@ func (c cassandraCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	}
 
 	port := p.GetInt(cassandraPort, 27577)
-	debug := p.GetBool(cassandraDebug, false)
-	timeout := p.GetInt(cassandraTimeout, 30)
-	connectTimeout := p.GetInt(cassandraConnectTimeout, 30)
-	numConns := p.GetInt(cassandraNumConns, 64)
-
-	// Set up gocql cluster targeting cqlproxy.
-	cluster := gocql.NewCluster(hosts...)
-	cluster.Port = port
-	cluster.Consistency = gocql.One
-	cluster.ProtoVersion = 4
-	cluster.NumConns = numConns
-	cluster.Timeout = time.Duration(timeout) * time.Second
-	cluster.ConnectTimeout = time.Duration(connectTimeout) * time.Second
-	cluster.DisableInitialHostLookup = true
-	cluster.IgnorePeerAddr = true
-	cluster.PageSize = 10000
-	cluster.ConvictionPolicy = &tolerantConvictionPolicy{}
-	cluster.ReconnectionPolicy = &gocql.ExponentialReconnectionPolicy{
-		MaxRetries:      10,
-		InitialInterval: 10 * time.Millisecond,
-	}
-	cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(
-		gocql.RoundRobinHostPolicy(),
-	)
-
-	// Redirect any discovered addresses back to the proxy.
-	cluster.AddressTranslator = &ProxyAddressTranslator{
-		proxyAddr: net.ParseIP(hosts[0]),
-		proxyPort: port,
-	}
-
-	if debug {
-		gocql.Logger = gocqlLogger{}
-	}
-
-	session, err := cluster.CreateSession()
-	if err != nil {
-		return nil, fmt.Errorf("gocql session creation failed: %w", err)
-	}
+	username := p.GetString(cassandraUsername, "")
+	password := p.GetString(cassandraPassword, "")
 
 	d := &cassandraDB{
-		session:   session,
+		hosts:     hosts,
+		port:      port,
+		username:  username,
+		password:  password,
 		verbose:   p.GetBool(prop.Verbose, prop.VerboseDefault),
 		loadMode:  p.GetBool(cassandraLoadMode, false),
 		stats:     newQueryStats(),
@@ -348,9 +538,8 @@ func (db *cassandraDB) Close() error {
 	}
 	fmt.Fprintf(os.Stderr,
 		"\n[STATS] === FINAL ===\n"+
-			"[STATS] total=%d ok=%d fail=%d no_hosts=%d timeouts=%d avg_ms=%.1f max_ms=%.1f\n",
-		total, db.stats.success.Load(), db.stats.failed.Load(),
-		db.stats.noHosts.Load(), db.stats.timeouts.Load(), avgMs, maxMs,
+			"[STATS] total=%d ok=%d fail=%d avg_ms=%.1f max_ms=%.1f\n",
+		total, db.stats.success.Load(), db.stats.failed.Load(), avgMs, maxMs,
 	)
 
 	summary := fmt.Sprintf("[HLL] === NODE TOTAL ===\n"+
@@ -381,13 +570,23 @@ func (db *cassandraDB) Close() error {
 		fmt.Printf("[HLL] summary saved to %s\n", logFile)
 	}
 
-	db.session.Close()
 	return nil
 }
 
 func (db *cassandraDB) InitThread(ctx context.Context, threadID int, _ int) context.Context {
+	host := db.hosts[rand.Intn(len(db.hosts))]
+	conn, err := dialMinConn(host, db.port, db.username, db.password)
+	if err != nil {
+		fmt.Printf("ERROR: thread %d failed to connect to cqlproxy: %v\n", threadID, err)
+		return context.WithValue(ctx, stateKey, &cassandraState{
+			rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
+			hll:      hyperloglog.New16(),
+			threadID: threadID,
+		})
+	}
 	return context.WithValue(ctx, stateKey, &cassandraState{
 		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
+		conn:     conn,
 		hll:      hyperloglog.New16(),
 		threadID: threadID,
 	})
@@ -401,30 +600,27 @@ func (db *cassandraDB) CleanupThread(ctx context.Context) {
 		db.hllMu.Lock()
 		db.globalHLL.Merge(s.hll)
 		db.hllMu.Unlock()
+		if s.conn != nil {
+			s.conn.close()
+		}
 	}
 }
 
 // ─── Core query executor ─────────────────────────────────────────────────────
 
 func (db *cassandraDB) runCQL(s *cassandraState, q string) error {
+	if s.conn == nil {
+		return fmt.Errorf("no cqlproxy connection for this thread")
+	}
 	if db.verbose {
 		fmt.Printf("CQL %s\n", q)
 	}
 	start := time.Now()
-	err := db.session.Query(noPrepare(q)).Exec()
+	err := s.conn.execQuery(s.nextStream(), q)
 	db.stats.record(time.Since(start), err)
-	return err
-}
-
-// runCQLRead executes a SELECT and discards rows (we measure latency, not data).
-func (db *cassandraDB) runCQLRead(s *cassandraState, q string) error {
-	if db.verbose {
-		fmt.Printf("CQL %s\n", q)
+	if err != nil && db.verbose {
+		fmt.Printf("ERR %s → %v\n", q, err)
 	}
-	start := time.Now()
-	iter := db.session.Query(noPrepare(q)).Iter()
-	err := iter.Close()
-	db.stats.record(time.Since(start), err)
 	return err
 }
 
@@ -470,12 +666,10 @@ func (db *cassandraDB) Read(ctx context.Context, _ string, key string, _ []strin
 	switch pickTable(s.rng, runWeights) {
 	case tableFiles:
 		q = fmt.Sprintf(`SELECT * FROM sd.files WHERE uuid = %s AND stripe_id = -1 LIMIT 1`, cqlStr(key))
-	case tableJobInstance:
-		q = fmt.Sprintf(`SELECT * FROM sd.job_instance WHERE job_id = %s LIMIT 1`, cqlStr(key))
 	default:
 		q = fmt.Sprintf(`SELECT * FROM sd.report_stats WHERE month_object_id = %s LIMIT 1`, cqlStr(key))
 	}
-	if err := db.runCQLRead(s, q); err != nil {
+	if err := db.runCQL(s, q); err != nil {
 		return nil, err
 	}
 	return map[string][]byte{"key": []byte(key)}, nil
@@ -488,22 +682,12 @@ func (db *cassandraDB) Scan(ctx context.Context, _ string, startKey string, coun
 	if count <= 0 {
 		count = 10
 	}
-	var q string
-	switch pickTable(s.rng, scanWeights) {
-	case tableJobInstance:
-		// Token range scan — mirrors JFL job discovery pattern.
-		q = fmt.Sprintf(
-			`SELECT * FROM sd.job_instance WHERE token(job_id) >= token(%s) LIMIT %d`,
-			cqlStr(startKey), count,
-		)
-	default:
-		// Clustering key range scan — all stripes for one uuid.
-		q = fmt.Sprintf(
-			`SELECT * FROM sd.files WHERE uuid = %s AND stripe_id >= 0 LIMIT %d`,
-			cqlStr(startKey), count,
-		)
-	}
-	if err := db.runCQLRead(s, q); err != nil {
+	// Clustering key range scan — all stripes for one uuid.
+	q := fmt.Sprintf(
+		`SELECT * FROM sd.files WHERE uuid = %s AND stripe_id >= 0 LIMIT %d`,
+		cqlStr(startKey), count,
+	)
+	if err := db.runCQL(s, q); err != nil {
 		return nil, err
 	}
 	return nil, nil // rows discarded — we care about QPS/latency, not data
@@ -513,26 +697,11 @@ func (db *cassandraDB) Scan(ctx context.Context, _ string, startKey string, coun
 
 func (db *cassandraDB) Update(ctx context.Context, _ string, key string, _ map[string][]byte) error {
 	s := ctx.Value(stateKey).(*cassandraState)
-	var q string
-	switch pickTable(s.rng, runWeights) {
-	case tableFiles:
-		q = fmt.Sprintf(
-			`UPDATE sd.files SET parent_uuid_hint = %s WHERE uuid = %s AND stripe_id = -1`,
-			cqlStr(fmt.Sprintf("parent-%x", s.rng.Int63())), cqlStr(key),
-		)
-	case tableJobInstance:
-		statuses := []string{"QUEUED", "RUNNING", "SUCCEEDED", "FAILED"}
-		q = fmt.Sprintf(
-			`UPDATE sd.job_instance SET status = %s WHERE job_id = %s AND instance_id = %d`,
-			cqlStr(statuses[s.rng.Intn(4)]), cqlStr(key), s.rng.Int63n(5),
-		)
-	default:
-		// report_stats PK includes creation_time; route updates to files instead
-		q = fmt.Sprintf(
-			`UPDATE sd.files SET parent_uuid_hint = %s WHERE uuid = %s AND stripe_id = -1`,
-			cqlStr(fmt.Sprintf("parent-%x", s.rng.Int63())), cqlStr(key),
-		)
-	}
+	// All updates route to files (report_stats PK includes creation_time, making updates impractical).
+	q := fmt.Sprintf(
+		`UPDATE sd.files SET parent_uuid_hint = %s WHERE uuid = %s AND stripe_id = -1`,
+		cqlStr(fmt.Sprintf("parent-%x", s.rng.Int63())), cqlStr(key),
+	)
 	return db.runCQL(s, q)
 }
 
@@ -546,51 +715,72 @@ func (db *cassandraDB) Insert(ctx context.Context, _ string, key string, _ map[s
 	}
 	switch pickTable(s.rng, weights) {
 	case tableFiles:
-		return db.runCQL(s, fmt.Sprintf(
-			`INSERT INTO sd.files (uuid, stripe_id, parent_uuid_hint, birth_time) VALUES (%s, -1, %s, %d)`,
-			cqlStr(key),
-			cqlStr(fmt.Sprintf("parent-%x", s.rng.Int63())),
-			time.Now().UnixNano(),
-		))
-	case tableJobInstance:
-		jobTypes := []string{"BACKUP", "RESTORE", "REPLICATION", "CLOUD_ARCHIVAL"}
-		statuses := []string{"QUEUED", "RUNNING", "SUCCEEDED", "FAILED"}
-		ts := time.Now().Format("2006-01-02 15:04:05.999-0700")
-		return db.runCQL(s, fmt.Sprintf(
-			`INSERT INTO sd.job_instance (job_id, instance_id, job_type_2, status, start_time) VALUES (%s, %d, %s, %s, %s)`,
-			cqlStr(key),
-			s.rng.Int63n(5),
-			cqlStr(jobTypes[s.rng.Intn(4)]),
-			cqlStr(statuses[s.rng.Intn(4)]),
-			cqlStr(ts),
-		))
+		return db.insertFiles(s, key)
 	default:
-		creationTime := time.Unix(int64(s.rng.Uint32())%int64(365*24*3600), 0).UTC().Format(time.RFC3339)
-		return db.runCQL(s, fmt.Sprintf(
-			`INSERT INTO sd.report_stats (month_object_id, creation_time, local) VALUES (%s, %s, '%d')`,
-			cqlStr(key),
-			cqlStr(creationTime),
-			s.rng.Int63n(1<<40),
-		))
+		return db.insertReportStats(s, key)
 	}
+}
+
+func (db *cassandraDB) insertFiles(s *cassandraState, key string) error {
+	rng := s.rng
+	parentHint := randHex16(rng)
+	birthTime := time.Now().Unix() - rng.Int63n(30*24*3600)
+	directorySpec := genDirectorySpec(rng)
+	parentMap := genParentMap(rng, parentHint)
+	childMap := genChildMap(rng)
+
+	openHeartbeat := "null"
+	if rng.Float64() < 0.20 {
+		openHeartbeat = fmt.Sprintf("%d", birthTime+rng.Int63n(86400))
+	}
+
+	q := fmt.Sprintf(
+		`INSERT INTO sd.files (uuid, stripe_id, birth_time, child_map, directory_spec, lock, open_heartbeat_time, parent_map, parent_uuid_hint, stripe_metadata, symlink_target) VALUES (%s, -1, %d, %s, %s, null, %s, %s, %s, null, null)`,
+		cqlStr(key), birthTime, cqlHexBlob(childMap), cqlStr(directorySpec),
+		openHeartbeat, cqlStr(parentMap), cqlStr(parentHint),
+	)
+	return db.runCQL(s, q)
+}
+
+func (db *cassandraDB) insertReportStats(s *cassandraState, key string) error {
+	rng := s.rng
+	baseTime := time.Now().Add(-time.Duration(rng.Int63n(int64(180 * 24 * time.Hour))))
+	creationTime := baseTime.UTC().Format("2006-01-02T15:04:05+0000")
+
+	logicalBytes := rng.Int63n(100) * 1073741824
+	ingestedBytes := rng.Int63n(50) * 1073741824
+	exclusivePhys := rng.Int63n(30) * 1073741824
+	sharedPhys := rng.Int63n(20) * 1073741824
+	lastSnapLogical := rng.Int63n(100) * 1073741824
+	provisionedOpt := int64(1+rng.Intn(20)) * 1099511627776
+
+	local := fmt.Sprintf(
+		`{"logicalBytes":%d,"ingestedBytes":%d,"exclusivePhysicalBytes":%d,"sharedPhysicalBytes":%d,"indexStorageBytes":0,"lastSnapshotLogicalBytes":%d,"cdpLogStorageBytes":0,"cdpLocalThroughput":0.0,"totalIngestedBytes":%d,"preCrossPreCompBytes":0,"fairnessPhysicalBytes":0,"provisionedBytesOpt":%d}`,
+		logicalBytes, ingestedBytes, exclusivePhys, sharedPhys,
+		lastSnapLogical, ingestedBytes, provisionedOpt,
+	)
+
+	archivalBytes := rng.Int63n(10) * 1073741824
+	var archival string
+	if rng.Float64() < 0.80 {
+		archival = fmt.Sprintf(`{"archivalBytes":%d,"ingestedBytes":%d,"logicalBytes":%d}`,
+			archivalBytes, archivalBytes/2, archivalBytes)
+	} else {
+		archival = `{"perLocationStats":{}}`
+	}
+
+	q := fmt.Sprintf(
+		`INSERT INTO sd.report_stats (month_object_id, creation_time, local, archival) VALUES (%s, %s, %s, %s)`,
+		cqlStr(key), cqlStr(creationTime), cqlStr(local), cqlStr(archival),
+	)
+	return db.runCQL(s, q)
 }
 
 // ─── Delete (1%) ──────────────────────────────────────────────────────────────
 
 func (db *cassandraDB) Delete(ctx context.Context, _ string, key string) error {
 	s := ctx.Value(stateKey).(*cassandraState)
-	var q string
-	switch pickTable(s.rng, runWeights) {
-	case tableFiles:
-		q = fmt.Sprintf(`DELETE FROM sd.files WHERE uuid = %s AND stripe_id = -1`, cqlStr(key))
-	case tableJobInstance:
-		q = fmt.Sprintf(
-			`DELETE FROM sd.job_instance WHERE job_id = %s AND instance_id = %d`,
-			cqlStr(key), s.rng.Int63n(5),
-		)
-	default:
-		// report_stats PK includes creation_time; route to files
-		q = fmt.Sprintf(`DELETE FROM sd.files WHERE uuid = %s AND stripe_id = -1`, cqlStr(key))
-	}
+	// All cases route to files delete (job_instance/report_stats deletes are unsafe).
+	q := fmt.Sprintf(`DELETE FROM sd.files WHERE uuid = %s AND stripe_id = -1`, cqlStr(key))
 	return db.runCQL(s, q)
 }

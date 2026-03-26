@@ -18,16 +18,16 @@ workload=core
 recordcount=15000000
 operationcount=100000000
 
-# Concurrency: 100 threads, capped at 2215 QPS to reach ~2500 total
+# Concurrency: 100 threads, QPS ~ 2500
 threadcount=100
-target=2215
+target=2500
 
 # Operation mix matching production
-readproportion=0.942
-insertproportion=0.024
-updateproportion=0.024
-deleteproportion=0.010
-scanproportion=0
+readproportion=0.75
+scanproportion=0.20
+insertproportion=0.02
+updateproportion=0.02
+deleteproportion=0.01
 
 # Zipfian reflects real workloads (hot keys = active jobs/files)
 requestdistribution=zipfian
@@ -36,7 +36,7 @@ requestdistribution=zipfian
 measurementtype=histogram
 
 # CockroachDB connection settings
-crdb.hosts=10.49.1.186,10.49.1.187,10.49.1.192,10.49.1.194
+crdb.hosts=127.0.0.1
 crdb.port=26257
 crdb.user=root
 crdb.password=
