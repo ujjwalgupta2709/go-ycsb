@@ -47,6 +47,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression v1.4.26
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.17.1
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.27.0
+	github.com/scaledata/gocql v0.0.0-20250930201118-e0dbb4f6335f
 	github.com/twmb/murmur3 v1.1.3
 	go.etcd.io/etcd/client/pkg/v3 v3.5.2
 	go.etcd.io/etcd/client/v3 v3.5.2

@@ -24,7 +24,9 @@ requestdistribution=uniform
 
 measurementtype=histogram
 
-# cqlproxy connection (raw CQL v4)
+# cqlproxy connection
 cassandra.hosts=127.0.0.1
 cassandra.port=27577
 cassandra.load_mode=true
+cassandra.username=rksupport
+# cassandra.password must be set per-node: cat /var/lib/rubrik/certs/cql_creds/rksupport

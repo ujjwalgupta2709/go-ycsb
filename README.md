@@ -426,17 +426,15 @@ export PASSWORD=$(sudo cat /var/lib/rubrik/certs/cql_creds/rksupport)
 **Load phase**:
 
 ```bash
-./go-ycsb-linux load rubrik_cassandra \
+./go-ycsb-linux load rubrik_cassandra_gocql \
   -P workload_rubrik_cassandra_load \
-  -p cassandra.hosts=127.0.0.1 \
-  -p cassandra.username=rksupport \
   -p cassandra.password=$PASSWORD
 ```
 
 **Run phase**:
 
 ```bash
-./go-ycsb-linux run rubrik_cassandra \
+./go-ycsb-linux run rubrik_cassandra_gocql \
   -P workload_rubrik_cassandra_uniform \
   -p cassandra.password=$PASSWORD
 ```
