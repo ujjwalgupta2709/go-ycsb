@@ -1,16 +1,3 @@
-// Copyright 2024 Rubrik, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 // Package rubrik_cockroachdb implements a go-ycsb DB driver that issues realistic
 // queries against the four main production CockroachDB tables in Rubrik CDM:
 //   - sd.files        (SDFS file/dir metadata; Atlas MDS point-lookups by uuid)
@@ -22,9 +9,6 @@
 // report_stats=4.
 // Load-phase table weights (% of inserts): files=82, event=12, event_series=4,
 // report_stats=2. Enable with crdb.load_mode=true.
-//
-// Global operation mix mirrors live production: 94.2% SELECT, 2.37% UPDATE,
-// 2.36% INSERT, 1.02% DELETE.
 package rubrik_cockroachdb
 
 import (
@@ -46,15 +30,15 @@ import (
 
 // Config property keys
 const (
-	crdbHost              = "crdb.host"
-	crdbHosts             = "crdb.hosts"              // comma-separated list, overrides crdb.host if set
-	crdbPort              = "crdb.port"
-	crdbUser              = "crdb.user"
-	crdbPassword          = "crdb.password"
-	crdbDBName            = "crdb.db"
-	crdbSSLMode           = "crdb.sslmode"
-	crdbLoadMode          = "crdb.load_mode"          // bool: true = load phase, false = run phase
-	crdbLoadTargetTables  = "crdb.load_target_tables" // comma-separated e.g. "sd.event,sd.report_stats"; empty = all tables
+	crdbHost             = "crdb.host"
+	crdbHosts            = "crdb.hosts"
+	crdbPort             = "crdb.port"
+	crdbUser             = "crdb.user"
+	crdbPassword         = "crdb.password"
+	crdbDBName           = "crdb.db"
+	crdbSSLMode          = "crdb.sslmode"
+	crdbLoadMode         = "crdb.load_mode"
+	crdbLoadTargetTables = "crdb.load_target_tables"
 )
 
 // table name constants
@@ -160,8 +144,8 @@ func randUUID4(rng *rand.Rand) string {
 	for i := range u {
 		u[i] = byte(rng.Intn(256))
 	}
-	u[6] = (u[6] & 0x0f) | 0x40 // version 4
-	u[8] = (u[8] & 0x3f) | 0x80 // variant 1
+	u[6] = (u[6] & 0x0f) | 0x40
+	u[8] = (u[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }
 
@@ -214,17 +198,14 @@ func genParentMap(rng *rand.Rand, parentHint string) string {
 func genChildMap(rng *rand.Rand) []byte {
 	r := rng.Float64()
 	if r < 0.60 {
-		return nil // NULL
+		return nil
 	}
 	if r < 0.70 {
-		return []byte{0x00, 0x00, 0x00, 0x00} // empty map header
+		return []byte{0x00, 0x00, 0x00, 0x00}
 	}
-	// Simulate 1-5 child entries; each entry is ~50-100 bytes of binary data
 	numEntries := 1 + rng.Intn(5)
-	// 4-byte count header + entries
-	size := 4 + numEntries*((16+4+16+4)*2) // approximate entry size
+	size := 4 + numEntries*((16+4+16+4)*2)
 	buf := make([]byte, size)
-	// Write entry count as big-endian uint32
 	buf[0] = 0x00
 	buf[1] = 0x00
 	buf[2] = 0x00
@@ -249,11 +230,11 @@ type cockroachCreator struct{}
 
 type cockroachDB struct {
 	p                *properties.Properties
-	pools            []*sql.DB // one pool per node for load balancing
+	pools            []*sql.DB
 	counter          atomic.Uint64
 	verbose          bool
 	loadMode         bool
-	loadTargetTables map[string]bool // nil = all tables; non-nil = only listed tables get inserts
+	loadTargetTables map[string]bool
 }
 
 func (db *cockroachDB) nextPool() *sql.DB {
@@ -555,13 +536,12 @@ func (db *cockroachDB) insertFiles(ctx context.Context, key string, rng *rand.Ra
 }
 
 func (db *cockroachDB) insertEvent(ctx context.Context, key string, rng *rand.Rand) error {
-	// Production event_name+event_type combos and matching event_info templates
 	type eventTemplate struct {
 		eventType  string
 		eventName  string
 		objectType string
-		msgTmpl    string // format string for event_info.message
-		msgID      string // event_info.id
+		msgTmpl    string
+		msgID      string
 	}
 	templates := []eventTemplate{
 		{"LogBackup", "Oracle.LogDeletionStart", "OracleDb",
@@ -720,8 +700,8 @@ func (db *cockroachDB) insertEventSeries(ctx context.Context, key string, rng *r
 	endMs := startedMs + rng.Int63n(3600*1000)
 	lastUpdateMs := endMs + rng.Int63n(1000)
 	slaID := randUUID4(rng)
-	logicalSize := int64(1+rng.Intn(10)) * 1073741824       // 1-10 GiB
-	objLogicalSize := int64(10+rng.Intn(5000)) * 1073741824 // 10 GiB - 5 TiB
+	logicalSize := int64(1+rng.Intn(10)) * 1073741824
+	objLogicalSize := int64(10+rng.Intn(5000)) * 1073741824
 
 	// Some series have dataTransferred + ingestionDuration (backup/logbackup), some don't (index)
 	var extraFields string
@@ -783,12 +763,12 @@ func (db *cockroachDB) insertReportStats(ctx context.Context, key string, rng *r
 	creationTime := baseTime.UTC().Format("2006-01-02T15:04:05+0000")
 
 	// local: JSON blob (~200-400 bytes) with storage stats
-	logicalBytes := rng.Int63n(100) * 1073741824             // 0-100 GiB
-	ingestedBytes := rng.Int63n(50) * 1073741824             // 0-50 GiB
-	exclusivePhys := rng.Int63n(30) * 1073741824             // 0-30 GiB
-	sharedPhys := rng.Int63n(20) * 1073741824                // 0-20 GiB
-	lastSnapLogical := rng.Int63n(100) * 1073741824          // 0-100 GiB
-	provisionedOpt := int64(1+rng.Intn(20)) * 1099511627776 // 1-20 TiB
+	logicalBytes := rng.Int63n(100) * 1073741824
+	ingestedBytes := rng.Int63n(50) * 1073741824
+	exclusivePhys := rng.Int63n(30) * 1073741824
+	sharedPhys := rng.Int63n(20) * 1073741824
+	lastSnapLogical := rng.Int63n(100) * 1073741824
+	provisionedOpt := int64(1+rng.Intn(20)) * 1099511627776
 
 	local := fmt.Sprintf(
 		`{"logicalBytes":%d,"ingestedBytes":%d,"exclusivePhysicalBytes":%d,"sharedPhysicalBytes":%d,"indexStorageBytes":0,"lastSnapshotLogicalBytes":%d,"cdpLogStorageBytes":0,"cdpLocalThroughput":0.0,"totalIngestedBytes":%d,"preCrossPreCompBytes":0,"fairnessPhysicalBytes":0,"provisionedBytesOpt":%d}`,
