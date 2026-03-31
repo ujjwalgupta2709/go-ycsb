@@ -18,7 +18,6 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"math/rand"
 	"net"
 	"os"
@@ -91,6 +90,10 @@ func pickTable(rng *rand.Rand, weights []tableWeight) string {
 }
 
 // cqlStr quotes a string value for safe inline embedding in CQL.
+// WARNING: This is a benchmark-only pattern. Production code must use
+// parameterized queries (bound variables) to prevent CQL injection.
+// We use inline values here because cqlproxy requires raw QUERY frames
+// (SkipPrepStmt=true) which don't support bound parameters.
 func cqlStr(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
@@ -147,17 +150,16 @@ type ProxyAddressTranslator struct {
 	proxyPort int
 }
 
-func NewProxyAddressTranslator(proxyHost string, proxyPort int) *ProxyAddressTranslator {
+func NewProxyAddressTranslator(proxyHost string, proxyPort int) (*ProxyAddressTranslator, error) {
 	proxyIP := net.ParseIP(proxyHost)
 	if proxyIP == nil {
 		ips, err := net.LookupIP(proxyHost)
 		if err != nil || len(ips) == 0 {
-			log.Printf("WARNING: failed to resolve proxy host %s: %v", proxyHost, err)
-			return &ProxyAddressTranslator{proxyIP: net.ParseIP("0.0.0.0"), proxyPort: proxyPort}
+			return nil, fmt.Errorf("failed to resolve proxy host %q: %v", proxyHost, err)
 		}
 		proxyIP = ips[0]
 	}
-	return &ProxyAddressTranslator{proxyIP: proxyIP, proxyPort: proxyPort}
+	return &ProxyAddressTranslator{proxyIP: proxyIP, proxyPort: proxyPort}, nil
 }
 
 func (t *ProxyAddressTranslator) Translate(addr net.IP, port int) (net.IP, int) {
@@ -295,7 +297,11 @@ func (c cassandraCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	// directly to backend CockroachDB nodes.
 	cluster.DisableInitialHostLookup = true
 	cluster.IgnorePeerAddr = true
-	cluster.AddressTranslator = NewProxyAddressTranslator(hosts[0], port)
+	addrTranslator, err := NewProxyAddressTranslator(hosts[0], port)
+	if err != nil {
+		return nil, fmt.Errorf("proxy address translator: %w", err)
+	}
+	cluster.AddressTranslator = addrTranslator
 
 	// Never mark the proxy host as down — it fronts multiple pods.
 	cluster.ConvictionPolicy = &tolerantConvictionPolicy{}
@@ -474,12 +480,16 @@ func (db *cassandraDB) Read(ctx context.Context, _ string, key string, _ []strin
 }
 
 func (db *cassandraDB) Scan(ctx context.Context, _ string, startKey string, count int, _ []string) ([]map[string][]byte, error) {
-	_ = ctx.Value(stateKey).(*cassandraState)
+	s := ctx.Value(stateKey).(*cassandraState)
+	s.hll.Insert([]byte(startKey))
+	s.ops++
 	if count <= 0 {
 		count = 10
 	}
+	// Scan for stripe_id >= -1 so we hit the rows we actually inserted
+	// (all inserts use stripe_id = -1). This exercises a real CQL range scan.
 	q := fmt.Sprintf(
-		`SELECT * FROM sd.files WHERE uuid = %s AND stripe_id >= 0 LIMIT %d`,
+		`SELECT * FROM sd.files WHERE uuid = %s AND stripe_id >= -1 LIMIT %d`,
 		cqlStr(startKey), count,
 	)
 	if err := db.execCQL(ctx, q); err != nil {
@@ -490,8 +500,13 @@ func (db *cassandraDB) Scan(ctx context.Context, _ string, startKey string, coun
 
 func (db *cassandraDB) Update(ctx context.Context, _ string, key string, _ map[string][]byte) error {
 	s := ctx.Value(stateKey).(*cassandraState)
+	s.hll.Insert([]byte(key))
+	s.ops++
 	// Use INSERT (upsert) instead of UPDATE to work around a cqlproxy bug
 	// where UPDATE statements cause "pq: SSL is not enabled on the server".
+	// NOTE: This CQL INSERT is an upsert that overwrites all unspecified columns
+	// to their defaults/nulls. This changes the data profile for subsequent reads
+	// but is acceptable for QPS/latency benchmarking.
 	q := fmt.Sprintf(
 		`INSERT INTO sd.files (uuid, stripe_id, parent_uuid_hint) VALUES (%s, -1, %s)`,
 		cqlStr(key), cqlStr(fmt.Sprintf("parent-%x", s.rng.Int63())),
@@ -572,6 +587,9 @@ func (db *cassandraDB) insertReportStats(ctx context.Context, s *cassandraState,
 }
 
 func (db *cassandraDB) Delete(ctx context.Context, _ string, key string) error {
+	s := ctx.Value(stateKey).(*cassandraState)
+	s.hll.Insert([]byte(key))
+	s.ops++
 	q := fmt.Sprintf(`DELETE FROM sd.files WHERE uuid = %s AND stripe_id = -1`, cqlStr(key))
 	return db.execCQL(ctx, q)
 }

@@ -82,68 +82,39 @@ func pickTable(rng *rand.Rand, weights []tableWeight) string {
 	return weights[len(weights)-1].name
 }
 
-// effectiveLoadWeights returns loadWeights filtered and re-normalised to
-// only include tables in db.loadTargetTables (all tables when nil).
-func (db *cockroachDB) effectiveLoadWeights() []tableWeight {
-	if db.loadTargetTables == nil {
-		return loadWeights
+// filterWeights returns weights filtered and re-normalised to only include
+// tables present in the targets map. Returns the original weights if targets
+// is nil or no targets match.
+func filterWeights(weights []tableWeight, targets map[string]bool) []tableWeight {
+	if targets == nil {
+		return weights
 	}
-	// Compute per-table deltas from the cumulative loadWeights slice.
-	deltas := make([]float64, len(loadWeights))
+	deltas := make([]float64, len(weights))
 	prev := 0.0
-	for i, w := range loadWeights {
-		deltas[i] = w.threshold - prev
-		prev = w.threshold
-	}
-	// Sum of selected deltas for normalisation.
-	var total float64
-	for i, w := range loadWeights {
-		if db.loadTargetTables[w.name] {
-			total += deltas[i]
-		}
-	}
-	if total == 0 {
-		return loadWeights // safety fallback
-	}
-	var result []tableWeight
-	cumulative := 0.0
-	for i, w := range loadWeights {
-		if db.loadTargetTables[w.name] {
-			cumulative += deltas[i] / total
-			result = append(result, tableWeight{w.name, cumulative})
-		}
-	}
-	return result
-}
-
-// effectiveRunWeights returns runWeights filtered and re-normalised to
-// only include tables in db.runTargetTables (all tables when nil).
-func (db *cockroachDB) effectiveRunWeights() []tableWeight {
-	if db.runTargetTables == nil {
-		return runWeights
-	}
-	deltas := make([]float64, len(runWeights))
-	prev := 0.0
-	for i, w := range runWeights {
+	for i, w := range weights {
 		deltas[i] = w.threshold - prev
 		prev = w.threshold
 	}
 	var total float64
-	for i, w := range runWeights {
-		if db.runTargetTables[w.name] {
+	for i, w := range weights {
+		if targets[w.name] {
 			total += deltas[i]
 		}
 	}
 	if total == 0 {
-		return runWeights
+		return weights
 	}
 	var result []tableWeight
 	cumulative := 0.0
-	for i, w := range runWeights {
-		if db.runTargetTables[w.name] {
+	for i, w := range weights {
+		if targets[w.name] {
 			cumulative += deltas[i] / total
 			result = append(result, tableWeight{w.name, cumulative})
 		}
+	}
+	// Guard against floating-point drift: ensure the last entry is exactly 1.0.
+	if len(result) > 0 {
+		result[len(result)-1].threshold = 1.0
 	}
 	return result
 }
@@ -262,13 +233,15 @@ var orgIDs = []string{
 type cockroachCreator struct{}
 
 type cockroachDB struct {
-	p                *properties.Properties
-	pools            []*sql.DB
-	counter          atomic.Uint64
-	verbose          bool
-	loadMode         bool
-	loadTargetTables map[string]bool
-	runTargetTables  map[string]bool
+	p                  *properties.Properties
+	pools              []*sql.DB
+	counter            atomic.Uint64
+	verbose            bool
+	loadMode           bool
+	loadTargetTables   map[string]bool
+	runTargetTables    map[string]bool
+	cachedRunWeights   []tableWeight // computed once in Create()
+	cachedLoadWeights  []tableWeight // computed once in Create()
 }
 
 func (db *cockroachDB) nextPool() *sql.DB {
@@ -357,6 +330,10 @@ func (c cockroachCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 		pool.SetMaxOpenConns(connsPerNode)
 		d.pools = append(d.pools, pool)
 	}
+
+	// Pre-compute filtered weights so they aren't re-allocated on every op.
+	d.cachedRunWeights = filterWeights(runWeights, d.runTargetTables)
+	d.cachedLoadWeights = filterWeights(loadWeights, d.loadTargetTables)
 
 	return d, nil
 }
@@ -510,7 +487,7 @@ func (db *cockroachDB) querySingleRow(ctx context.Context, query string, args ..
 
 func (db *cockroachDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
 	state := ctx.Value(stateKey).(*cockroachState)
-	switch pickTable(state.rng, db.effectiveRunWeights()) {
+	switch pickTable(state.rng, db.cachedRunWeights) {
 	case tableFiles:
 		return db.readFiles(ctx, key)
 	case tableEvent:
@@ -547,7 +524,7 @@ func (db *cockroachDB) Scan(ctx context.Context, table string, startKey string, 
 	if count <= 0 {
 		count = 10
 	}
-	switch pickTable(state.rng, db.effectiveRunWeights()) {
+	switch pickTable(state.rng, db.cachedRunWeights) {
 	case tableFiles:
 		return db.scanFiles(ctx, startKey, count)
 	case tableEvent:
@@ -560,11 +537,19 @@ func (db *cockroachDB) Scan(ctx context.Context, table string, startKey string, 
 }
 
 func (db *cockroachDB) scanFiles(ctx context.Context, key string, count int) ([]map[string][]byte, error) {
-	query := `SELECT token__uuid, uuid, stripe_id, birth_time, child_map, directory_spec, lock, open_heartbeat_time, parent_map, parent_uuid_hint, stripe_metadata, symlink_target FROM sd.files WHERE token__uuid = $1 AND uuid = $2 AND stripe_id >= 0 LIMIT $3`
-	return db.queryMultiRows(ctx, query, hashToken(key), key, count)
+	// Range scan by token__uuid. All inserted rows have stripe_id = -1, so
+	// scanning for stripe_id >= 0 would always return 0 rows. Instead, scan
+	// across multiple files starting from a token hash — exercises real range
+	// scan I/O on the files table.
+	query := `SELECT token__uuid, uuid, stripe_id, birth_time, child_map, directory_spec, lock, open_heartbeat_time, parent_map, parent_uuid_hint, stripe_metadata, symlink_target FROM sd.files WHERE token__uuid >= $1 ORDER BY token__uuid, uuid, stripe_id LIMIT $2`
+	return db.queryMultiRows(ctx, query, hashToken(key), count)
 }
 
 func (db *cockroachDB) scanEvent(ctx context.Context, key string, count int) ([]map[string][]byte, error) {
+	// Uses key as event_series_id (not event_id) to simulate the production
+	// pattern of fetching all events within a series. The key comes from YCSB's
+	// key generator, so hit rate depends on how many inserted events share the
+	// same event_series_id (which is a random UUID — expect mostly empty results).
 	query := `SELECT event_id, event_info, event_name, event_series_id, event_severity, event_status, event_type, ip_address, job_instance_id, managed_ids, notification_status, object_id, object_name, object_type, time FROM sd.event WHERE event_series_id = $1 ORDER BY time DESC, event_id ASC LIMIT $2`
 	return db.queryMultiRows(ctx, query, key, count)
 }
@@ -581,7 +566,7 @@ func (db *cockroachDB) scanReportStats(ctx context.Context, key string, count in
 
 func (db *cockroachDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
 	state := ctx.Value(stateKey).(*cockroachState)
-	switch pickTable(state.rng, db.effectiveRunWeights()) {
+	switch pickTable(state.rng, db.cachedRunWeights) {
 	case tableFiles:
 		query := `UPDATE sd.files SET open_heartbeat_time = $1 WHERE token__uuid = $2 AND uuid = $3 AND stripe_id = -1`
 		return db.execQuery(ctx, query, time.Now().UnixNano(), hashToken(key), key)
@@ -603,9 +588,9 @@ func (db *cockroachDB) Update(ctx context.Context, table string, key string, val
 
 func (db *cockroachDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
 	state := ctx.Value(stateKey).(*cockroachState)
-	weights := db.effectiveRunWeights()
+	weights := db.cachedRunWeights
 	if db.loadMode {
-		weights = db.effectiveLoadWeights()
+		weights = db.cachedLoadWeights
 	}
 	switch pickTable(state.rng, weights) {
 	case tableFiles:
@@ -870,9 +855,11 @@ func (db *cockroachDB) insertEventSeries(ctx context.Context, key string, rng *r
 }
 
 func (db *cockroachDB) insertReportStats(ctx context.Context, key string, rng *rand.Rand) error {
-	// creation_time: ISO 8601 format like 2025-10-09T05:13:55+0000
-	baseTime := time.Now().Add(-time.Duration(rng.Int63n(int64(180 * 24 * time.Hour))))
-	creationTime := baseTime.UTC().Format("2006-01-02T15:04:05+0000")
+	// Use derivedTime(key) so that Insert, Update, and Delete all agree on the
+	// full primary key (token__month_object_id, month_object_id, creation_time).
+	// Previously this used a random timestamp, causing Update/Delete to never
+	// match inserted rows.
+	creationTime := derivedTime(key)
 
 	// local: JSON blob (~200-400 bytes) with storage stats
 	logicalBytes := rng.Int63n(100) * 1073741824
@@ -912,7 +899,7 @@ func (db *cockroachDB) insertReportStats(ctx context.Context, key string, rng *r
 
 func (db *cockroachDB) Delete(ctx context.Context, table string, key string) error {
 	state := ctx.Value(stateKey).(*cockroachState)
-	switch pickTable(state.rng, db.effectiveRunWeights()) {
+	switch pickTable(state.rng, db.cachedRunWeights) {
 	case tableFiles:
 		query := `DELETE FROM sd.files WHERE token__uuid = $1 AND uuid = $2 AND stripe_id = -1`
 		return db.execQuery(ctx, query, hashToken(key), key)

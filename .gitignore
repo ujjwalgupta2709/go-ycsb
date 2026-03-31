@@ -13,3 +13,8 @@ tool/tool
 
 # hdr-plot output format
 *.png
+
+# Build artifacts
+/go-ycsb
+/go-ycsb-linux
+/hll-merge
