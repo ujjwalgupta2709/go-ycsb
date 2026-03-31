@@ -1,0 +1,52 @@
+# Rubrik CockroachDB YCSB workload — RUN phase (event + event_series ONLY)
+# Direct SQL against CockroachDB for tables NOT served via cqlproxy.
+#
+# In production, files and report_stats go through cqlproxy (CQL path),
+# while event and event_series are queried directly via SQL.
+# This workload isolates the SQL-only tables.
+#
+# Table weights (after re-normalisation from original runWeights):
+#   - sd.event        61%
+#   - sd.event_series 39%
+#
+# Run alongside workload_rubrik_cassandra_uniform_prod_p75load at 700 QPS/node
+# for a combined 1000 QPS/node matching production.
+
+workload=core
+
+# Key space must match recordcount used in the load phase (50M total across all tables)
+recordcount=50000000
+operationcount=15000000
+
+# 12 threads per node, 300 QPS/node
+threadcount=12
+target=300
+
+# Operation mix matching production
+readproportion=0.75
+scanproportion=0.20
+insertproportion=0.02
+updateproportion=0.02
+deleteproportion=0.01
+
+# Uniform: every key equally likely — maximum cache pressure
+requestdistribution=uniform
+
+# Scan size: uniform between 10 and 100 rows per scan
+maxscanlength=100
+minscanlength=10
+scanlengthdistribution=uniform
+
+measurementtype=histogram
+
+# CockroachDB connection settings
+crdb.hosts=127.0.0.1
+crdb.port=26257
+crdb.user=root
+crdb.password=
+crdb.db=sd
+crdb.sslmode=require
+crdb.load_mode=false
+
+# Restrict run phase to event tables only (files/report_stats go via cqlproxy)
+crdb.run_target_tables=sd.event,sd.event_series

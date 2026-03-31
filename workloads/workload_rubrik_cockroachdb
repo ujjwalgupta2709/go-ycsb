@@ -1,0 +1,48 @@
+# Rubrik CockroachDB YCSB workload — RUN phase
+# Derived from live production cluster (Accelya, AWS, 8-node, ~14.8k QPS):
+#   - 94.2% SELECT, 2.37% UPDATE, 2.36% INSERT, 1.02% DELETE
+#
+# Table weights (set in db.go):
+#   - sd.files        60%  (Atlas MDS header lookups)
+#   - sd.event        22%
+#   - sd.event_series 14%
+#   - sd.report_stats  4%
+#
+# Target: ~2500 total QPS (285 existing steady-state + 2215 YCSB)
+# Designed for a 4-node Azure CCES cluster.
+
+workload=core
+
+# Key space must match recordcount used in the load phase (50M total across all tables)
+recordcount=50000000
+operationcount=50000000
+
+# Concurrency: 100 threads, QPS ~ 2500
+threadcount=100
+target=2500
+
+# Operation mix matching production
+readproportion=0.75
+scanproportion=0.20
+insertproportion=0.02
+updateproportion=0.02
+deleteproportion=0.01
+
+# Uniform: every key equally likely — maximum cache pressure
+requestdistribution=uniform
+
+# Scan size: uniform between 10 and 100 rows per scan
+maxscanlength=100
+minscanlength=10
+scanlengthdistribution=uniform
+
+measurementtype=histogram
+
+# CockroachDB connection settings
+crdb.hosts=127.0.0.1
+crdb.port=26257
+crdb.user=root
+crdb.password=
+crdb.db=sd
+crdb.sslmode=require
+crdb.load_mode=false

@@ -1,0 +1,32 @@
+# Rubrik Cassandra (cqlproxy) YCSB workload — LOAD phase
+# Issues CQL INSERTs against cqlproxy (port 27577).
+# cqlproxy translates to SQL and handles murmur3 token hashing.
+#
+# Table weights:
+#   - files         95%  → ~14,250,000 rows
+#   - report_stats   5%  →    ~750,000 rows
+
+workload=core
+
+recordcount=15000000
+operationcount=15000000
+
+# No QPS cap during load; use more threads for throughput
+threadcount=200
+
+# Pure insert, uniform key distribution
+readproportion=0
+updateproportion=0
+insertproportion=1.0
+deleteproportion=0
+scanproportion=0
+requestdistribution=uniform
+
+measurementtype=histogram
+
+# cqlproxy connection
+cassandra.hosts=127.0.0.1
+cassandra.port=27577
+cassandra.load_mode=true
+cassandra.username=rksupport
+# cassandra.password must be set per-node: cat /var/lib/rubrik/certs/cql_creds/rksupport
