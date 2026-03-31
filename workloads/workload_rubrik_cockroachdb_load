@@ -2,16 +2,16 @@
 # Pre-populates tables before the run phase so reads are not wasted.
 #
 # Table weights (set in db.go when crdb.load_mode=true):
-#   - sd.files        82%  → ~24,600,000 rows
-#   - sd.event        12%  →  ~3,600,000 rows
-#   - sd.event_series  4%  →  ~1,200,000 rows
-#   - sd.report_stats  2%  →    ~600,000 rows
+#   - sd.files        82%  → ~41,000,000 rows
+#   - sd.event        12%  →  ~6,000,000 rows
+#   - sd.event_series  4%  →  ~2,000,000 rows
+#   - sd.report_stats  2%  →  ~1,000,000 rows
 #
 
 workload=core
 
-recordcount=30000000
-operationcount=30000000
+recordcount=50000000
+operationcount=50000000
 
 # No QPS cap during load; use more threads for throughput
 threadcount=100

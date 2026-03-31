@@ -13,9 +13,9 @@
 
 workload=core
 
-# Key space must match recordcount used in the load phase
-recordcount=15000000
-operationcount=100000000
+# Key space must match recordcount used in the load phase (50M total across all tables)
+recordcount=50000000
+operationcount=50000000
 
 # Concurrency: 100 threads, QPS ~ 2500
 threadcount=100
@@ -28,10 +28,14 @@ insertproportion=0.02
 updateproportion=0.02
 deleteproportion=0.01
 
-# Zipfian reflects real workloads (hot keys = active jobs/files)
-requestdistribution=zipfian
+# Uniform: every key equally likely — maximum cache pressure
+requestdistribution=uniform
 
-# Histogram for latency percentiles (p50, p95, p99)
+# Scan size: uniform between 10 and 100 rows per scan
+maxscanlength=100
+minscanlength=10
+scanlengthdistribution=uniform
+
 measurementtype=histogram
 
 # CockroachDB connection settings

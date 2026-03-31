@@ -39,6 +39,7 @@ const (
 	crdbSSLMode          = "crdb.sslmode"
 	crdbLoadMode         = "crdb.load_mode"
 	crdbLoadTargetTables = "crdb.load_target_tables"
+	crdbRunTargetTables  = "crdb.run_target_tables"
 )
 
 // table name constants
@@ -108,6 +109,38 @@ func (db *cockroachDB) effectiveLoadWeights() []tableWeight {
 	cumulative := 0.0
 	for i, w := range loadWeights {
 		if db.loadTargetTables[w.name] {
+			cumulative += deltas[i] / total
+			result = append(result, tableWeight{w.name, cumulative})
+		}
+	}
+	return result
+}
+
+// effectiveRunWeights returns runWeights filtered and re-normalised to
+// only include tables in db.runTargetTables (all tables when nil).
+func (db *cockroachDB) effectiveRunWeights() []tableWeight {
+	if db.runTargetTables == nil {
+		return runWeights
+	}
+	deltas := make([]float64, len(runWeights))
+	prev := 0.0
+	for i, w := range runWeights {
+		deltas[i] = w.threshold - prev
+		prev = w.threshold
+	}
+	var total float64
+	for i, w := range runWeights {
+		if db.runTargetTables[w.name] {
+			total += deltas[i]
+		}
+	}
+	if total == 0 {
+		return runWeights
+	}
+	var result []tableWeight
+	cumulative := 0.0
+	for i, w := range runWeights {
+		if db.runTargetTables[w.name] {
 			cumulative += deltas[i] / total
 			result = append(result, tableWeight{w.name, cumulative})
 		}
@@ -235,6 +268,7 @@ type cockroachDB struct {
 	verbose          bool
 	loadMode         bool
 	loadTargetTables map[string]bool
+	runTargetTables  map[string]bool
 }
 
 func (db *cockroachDB) nextPool() *sql.DB {
@@ -268,6 +302,14 @@ func (c cockroachCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 		for _, t := range strings.Split(tables, ",") {
 			if trimmed := strings.TrimSpace(t); trimmed != "" {
 				d.loadTargetTables[trimmed] = true
+			}
+		}
+	}
+	if tables := p.GetString(crdbRunTargetTables, ""); tables != "" {
+		d.runTargetTables = make(map[string]bool)
+		for _, t := range strings.Split(tables, ",") {
+			if trimmed := strings.TrimSpace(t); trimmed != "" {
+				d.runTargetTables[trimmed] = true
 			}
 		}
 	}
@@ -392,6 +434,43 @@ func (db *cockroachDB) execQuery(ctx context.Context, query string, args ...inte
 	return err
 }
 
+func (db *cockroachDB) queryMultiRows(ctx context.Context, query string, args ...interface{}) ([]map[string][]byte, error) {
+	if db.verbose {
+		fmt.Printf("%s %v\n", query, args)
+	}
+	stmt, err := db.getAndCacheStmt(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := stmt.QueryContext(ctx, args...)
+	if err != nil {
+		db.clearCacheIfFailed(ctx, query, err)
+		return nil, err
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var results []map[string][]byte
+	for rows.Next() {
+		dest := make([]interface{}, len(cols))
+		for i := range dest {
+			dest[i] = new([]byte)
+		}
+		if err = rows.Scan(dest...); err != nil {
+			return results, err
+		}
+		m := make(map[string][]byte, len(cols))
+		for i, col := range cols {
+			m[col] = *dest[i].(*[]byte)
+		}
+		results = append(results, m)
+	}
+	return results, rows.Err()
+}
+
 func (db *cockroachDB) querySingleRow(ctx context.Context, query string, args ...interface{}) (map[string][]byte, error) {
 	if db.verbose {
 		fmt.Printf("%s %v\n", query, args)
@@ -431,7 +510,7 @@ func (db *cockroachDB) querySingleRow(ctx context.Context, query string, args ..
 
 func (db *cockroachDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
 	state := ctx.Value(stateKey).(*cockroachState)
-	switch pickTable(state.rng, runWeights) {
+	switch pickTable(state.rng, db.effectiveRunWeights()) {
 	case tableFiles:
 		return db.readFiles(ctx, key)
 	case tableEvent:
@@ -444,32 +523,65 @@ func (db *cockroachDB) Read(ctx context.Context, table string, key string, field
 }
 
 func (db *cockroachDB) readFiles(ctx context.Context, key string) (map[string][]byte, error) {
-	query := `SELECT uuid, stripe_id, parent_uuid_hint FROM sd.files WHERE token__uuid = $1 AND uuid = $2 AND stripe_id = -1 LIMIT 1`
+	query := `SELECT token__uuid, uuid, stripe_id, birth_time, child_map, directory_spec, lock, open_heartbeat_time, parent_map, parent_uuid_hint, stripe_metadata, symlink_target FROM sd.files WHERE token__uuid = $1 AND uuid = $2 AND stripe_id = -1 LIMIT 1`
 	return db.querySingleRow(ctx, query, hashToken(key), key)
 }
 
 func (db *cockroachDB) readEvent(ctx context.Context, key string) (map[string][]byte, error) {
-	query := `SELECT event_id, event_type, event_severity, object_id FROM sd.event WHERE event_id = $1 LIMIT 1`
+	query := `SELECT event_id, event_info, event_name, event_series_id, event_severity, event_status, event_type, ip_address, job_instance_id, managed_ids, notification_status, object_id, object_name, object_type, time FROM sd.event WHERE event_id = $1 LIMIT 1`
 	return db.querySingleRow(ctx, query, key)
 }
 
 func (db *cockroachDB) readEventSeries(ctx context.Context, orgID, key string) (map[string][]byte, error) {
-	query := `SELECT organization_id, event_series_id, latest_event_status, latest_time FROM sd.event_series WHERE organization_id = $1 AND event_series_id = $2 LIMIT 1`
+	query := `SELECT organization_id, event_series_id, event_series_stats, event_series_status, latest_event_id, latest_event_name, latest_event_severity, latest_event_status, latest_event_type, latest_object_id, latest_object_name, latest_object_type, latest_time, warning_count, rsc_user_id FROM sd.event_series WHERE organization_id = $1 AND event_series_id = $2 LIMIT 1`
 	return db.querySingleRow(ctx, query, orgID, key)
 }
 
 func (db *cockroachDB) readReportStats(ctx context.Context, key string) (map[string][]byte, error) {
-	query := `SELECT token__month_object_id, month_object_id, creation_time, local FROM sd.report_stats WHERE token__month_object_id = $1 AND month_object_id = $2 LIMIT 1`
+	query := `SELECT token__month_object_id, month_object_id, creation_time, local, archival FROM sd.report_stats WHERE token__month_object_id = $1 AND month_object_id = $2 LIMIT 1`
 	return db.querySingleRow(ctx, query, hashToken(key), key)
 }
 
 func (db *cockroachDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
-	return nil, nil
+	state := ctx.Value(stateKey).(*cockroachState)
+	if count <= 0 {
+		count = 10
+	}
+	switch pickTable(state.rng, db.effectiveRunWeights()) {
+	case tableFiles:
+		return db.scanFiles(ctx, startKey, count)
+	case tableEvent:
+		return db.scanEvent(ctx, startKey, count)
+	case tableEventSeries:
+		return db.scanEventSeries(ctx, state.rng, startKey, count)
+	default:
+		return db.scanReportStats(ctx, startKey, count)
+	}
+}
+
+func (db *cockroachDB) scanFiles(ctx context.Context, key string, count int) ([]map[string][]byte, error) {
+	query := `SELECT token__uuid, uuid, stripe_id, birth_time, child_map, directory_spec, lock, open_heartbeat_time, parent_map, parent_uuid_hint, stripe_metadata, symlink_target FROM sd.files WHERE token__uuid = $1 AND uuid = $2 AND stripe_id >= 0 LIMIT $3`
+	return db.queryMultiRows(ctx, query, hashToken(key), key, count)
+}
+
+func (db *cockroachDB) scanEvent(ctx context.Context, key string, count int) ([]map[string][]byte, error) {
+	query := `SELECT event_id, event_info, event_name, event_series_id, event_severity, event_status, event_type, ip_address, job_instance_id, managed_ids, notification_status, object_id, object_name, object_type, time FROM sd.event WHERE event_series_id = $1 ORDER BY time DESC, event_id ASC LIMIT $2`
+	return db.queryMultiRows(ctx, query, key, count)
+}
+
+func (db *cockroachDB) scanEventSeries(ctx context.Context, rng *rand.Rand, key string, count int) ([]map[string][]byte, error) {
+	query := `SELECT organization_id, event_series_id, event_series_stats, event_series_status, latest_event_id, latest_event_name, latest_event_severity, latest_event_status, latest_event_type, latest_object_id, latest_object_name, latest_object_type, latest_time, warning_count, rsc_user_id FROM sd.event_series WHERE organization_id = $1 AND event_series_id >= $2 ORDER BY event_series_id ASC LIMIT $3`
+	return db.queryMultiRows(ctx, query, orgIDs[rng.Intn(len(orgIDs))], key, count)
+}
+
+func (db *cockroachDB) scanReportStats(ctx context.Context, key string, count int) ([]map[string][]byte, error) {
+	query := `SELECT token__month_object_id, month_object_id, creation_time, local, archival FROM sd.report_stats WHERE token__month_object_id = $1 AND month_object_id >= $2 LIMIT $3`
+	return db.queryMultiRows(ctx, query, hashToken(key), key, count)
 }
 
 func (db *cockroachDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
 	state := ctx.Value(stateKey).(*cockroachState)
-	switch pickTable(state.rng, runWeights) {
+	switch pickTable(state.rng, db.effectiveRunWeights()) {
 	case tableFiles:
 		query := `UPDATE sd.files SET open_heartbeat_time = $1 WHERE token__uuid = $2 AND uuid = $3 AND stripe_id = -1`
 		return db.execQuery(ctx, query, time.Now().UnixNano(), hashToken(key), key)
@@ -491,7 +603,7 @@ func (db *cockroachDB) Update(ctx context.Context, table string, key string, val
 
 func (db *cockroachDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
 	state := ctx.Value(stateKey).(*cockroachState)
-	weights := runWeights
+	weights := db.effectiveRunWeights()
 	if db.loadMode {
 		weights = db.effectiveLoadWeights()
 	}
@@ -800,7 +912,7 @@ func (db *cockroachDB) insertReportStats(ctx context.Context, key string, rng *r
 
 func (db *cockroachDB) Delete(ctx context.Context, table string, key string) error {
 	state := ctx.Value(stateKey).(*cockroachState)
-	switch pickTable(state.rng, runWeights) {
+	switch pickTable(state.rng, db.effectiveRunWeights()) {
 	case tableFiles:
 		query := `DELETE FROM sd.files WHERE token__uuid = $1 AND uuid = $2 AND stripe_id = -1`
 		return db.execQuery(ctx, query, hashToken(key), key)
