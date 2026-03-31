@@ -482,20 +482,7 @@ sudo ./go-ycsb-linux run rubrik_cockroachdb \
   -P workload_rubrik_cockroachdb_event
 ```
 
-### 6. CPU monitoring
-
-Use `scripts/cpu_monitor.sh` to capture high-CPU processes during a benchmark run:
-
-```bash
-# Log any process using >25% CPU, poll every 3 seconds
-./cpu_monitor.sh 25 3 &
-
-# Run benchmark...
-# When done, kill the monitor to see summary
-kill %1
-```
-
-### 7. Multi-node key cardinality (HLL merge)
+### 6. Multi-node key cardinality (HLL merge)
 
 The Cassandra driver tracks unique keys per node using HyperLogLog sketches.
 After a run completes on each node, it writes `hll_sketch_<timestamp>.bin`.
