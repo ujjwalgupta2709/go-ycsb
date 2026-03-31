@@ -439,17 +439,63 @@ export PASSWORD=$(sudo cat /var/lib/rubrik/certs/cql_creds/rksupport)
   -p cassandra.password=$PASSWORD
 ```
 
-### 5. Available Cassandra workload variants
+### 5. Available workload variants
 
-| Workload file | Distribution | Threads | Target QPS | Use case |
+#### Standalone workloads (all tables through one driver)
+
+| Workload file | Driver | Distribution | Threads | Target QPS | Use case |
+|-|-|-|-|-|-|
+| `workload_rubrik_cassandra_load` | cassandra | uniform | 200 | unlimited | Pre-populate tables |
+| `workload_rubrik_cassandra_uniform` | cassandra | uniform | 100 | 2500 | P99 load |
+| `workload_rubrik_cassandra_hotspot` | cassandra | 80/20 hotspot | 100 | 2500 | Realistic hot/cold access |
+| `workload_rubrik_cassandra_uniform_p50load` | cassandra | uniform | 20 | 500 | P50 traffic level |
+| `workload_rubrik_cassandra_uniform_p75load` | cassandra | uniform | 40 | 1000 | P75 traffic level |
+| `workload_rubrik_cockroachdb` | cockroachdb | uniform | 100 | 2500 | All 4 tables via SQL |
+| `workload_rubrik_cockroachdb_load` | cockroachdb | uniform | 200 | unlimited | Pre-populate all 4 tables |
+
+#### Production-split workloads (run both simultaneously)
+
+In production, `files` and `report_stats` are queried via cqlproxy (CQL),
+while `event` and `event_series` are queried directly via SQL. These workloads
+split the traffic the same way — run both on each node simultaneously for
+a combined 2500 QPS/node:
+
+| Workload file | Driver | Tables | Threads | Target QPS |
 |-|-|-|-|-|
-| `workload_rubrik_cassandra_load` | uniform | 200 | unlimited | Pre-populate tables |
-| `workload_rubrik_cassandra_uniform` | uniform | 100 | 2500 | P99 load |
-| `workload_rubrik_cassandra_hotspot` | 80/20 hotspot | 100 | 2500 | Realistic hot/cold access |
-| `workload_rubrik_cassandra_uniform_p50load` | uniform | 20 | 500 | P50 traffic level |
-| `workload_rubrik_cassandra_uniform_p75load` | uniform | 40 | 1000 | P75 traffic level |
+| `workload_rubrik_cassandra_prod` | cassandra | files, report_stats | 70 | 1750 |
+| `workload_rubrik_cockroachdb_event` | cockroachdb | event, event_series | 30 | 750 |
+| `workload_rubrik_cassandra_prod_p50load` | cassandra | files, report_stats | 14 | 350 |
+| `workload_rubrik_cockroachdb_event_p50load` | cockroachdb | event, event_series | 6 | 150 |
+| `workload_rubrik_cassandra_prod_p75load` | cassandra | files, report_stats | 28 | 700 |
+| `workload_rubrik_cockroachdb_event_p75load` | cockroachdb | event, event_series | 12 | 300 |
 
-### 6. Multi-node key cardinality (HLL merge)
+Example (run both on each node):
+
+```bash
+# Terminal 1: CQL path (files + report_stats via cqlproxy)
+./go-ycsb-linux run rubrik_cassandra_gocql \
+  -P workload_rubrik_cassandra_prod \
+  -p cassandra.password=$PASSWORD
+
+# Terminal 2: SQL path (event + event_series direct to CockroachDB)
+sudo ./go-ycsb-linux run rubrik_cockroachdb \
+  -P workload_rubrik_cockroachdb_event
+```
+
+### 6. CPU monitoring
+
+Use `scripts/cpu_monitor.sh` to capture high-CPU processes during a benchmark run:
+
+```bash
+# Log any process using >25% CPU, poll every 3 seconds
+./cpu_monitor.sh 25 3 &
+
+# Run benchmark...
+# When done, kill the monitor to see summary
+kill %1
+```
+
+### 7. Multi-node key cardinality (HLL merge)
 
 The Cassandra driver tracks unique keys per node using HyperLogLog sketches.
 After a run completes on each node, it writes `hll_sketch_<timestamp>.bin`.
