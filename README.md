@@ -350,7 +350,117 @@ Common configurations:
 |s3.update_overwrite|true|Set `false` for update to perform a read-modify-write operation|
 |s3.scan_keys_only|false|Set `true` to have scan return only the keys of the objects|
 
-## TODO
+## Rubrik Benchmarking Guide
 
-- [ ] Support more measurement, like HdrHistogram
-- [ ] Add tests for generators
+### 1. Build
+
+Build for macOS (local testing):
+
+```bash
+make
+```
+
+Cross-compile for Linux (CDM cluster nodes):
+
+```bash
+GOOS=linux GOARCH=amd64 go build -o go-ycsb-linux cmd/go-ycsb/*
+```
+
+Build the HLL(Hyperloglog) merge utility (for Cassandra multi-node key cardinality):
+
+```bash
+go build -o hll-merge cmd/hll-merge/*
+```
+
+### 2. Deploy to cluster
+
+Copy the binary and workload config to each CDM node:
+
+```bash
+PEM=~/<PATH>/sdmain/deployment/ssh_keys/ubuntu.pem
+
+scp -i $PEM go-ycsb-linux ubuntu@<node-ip>:~/
+scp -i $PEM workloads/workload_rubrik_cockroachdb ubuntu@<node-ip>:~/
+scp -i $PEM workloads/workload_rubrik_cassandra_uniform ubuntu@<node-ip>:~/
+```
+
+### 3. Run: CockroachDB (direct SQL)
+
+SSH into the cluster node:
+
+```bash
+ssh -i $PEM ubuntu@<node-ip>
+```
+
+**Load phase** (pre-populate tables):
+
+```bash
+sudo ./go-ycsb-linux load rubrik_cockroachdb -P workload_rubrik_cockroachdb_load
+```
+
+**Run phase** (mixed read/write workload):
+
+```bash
+sudo ./go-ycsb-linux run rubrik_cockroachdb -P workload_rubrik_cockroachdb
+```
+
+Override settings on the command line:
+
+```bash
+sudo ./go-ycsb-linux run rubrik_cockroachdb -P workload_rubrik_cockroachdb \
+  -p crdb.hosts=10.0.1.1,10.0.1.2,10.0.1.3 \
+  -p crdb.sslmode=require \
+  -p threadcount=200 \
+  -p target=5000
+```
+
+### 4. Run: Cassandra (CQL via cqlproxy)
+
+SSH into the cluster node and read the cqlproxy password:
+
+```bash
+ssh -i $PEM ubuntu@<node-ip>
+export PASSWORD=$(sudo cat /var/lib/rubrik/certs/cql_creds/rksupport)
+```
+
+**Load phase**:
+
+```bash
+./go-ycsb-linux load rubrik_cassandra_gocql \
+  -P workload_rubrik_cassandra_load \
+  -p cassandra.password=$PASSWORD
+```
+
+**Run phase**:
+
+```bash
+./go-ycsb-linux run rubrik_cassandra_gocql \
+  -P workload_rubrik_cassandra_uniform \
+  -p cassandra.password=$PASSWORD
+```
+
+### 5. Available Cassandra workload variants
+
+| Workload file | Distribution | Threads | Target QPS | Use case |
+|-|-|-|-|-|
+| `workload_rubrik_cassandra_load` | uniform | 200 | unlimited | Pre-populate tables |
+| `workload_rubrik_cassandra_uniform` | uniform | 100 | 2500 | P99 load |
+| `workload_rubrik_cassandra_hotspot` | 80/20 hotspot | 100 | 2500 | Realistic hot/cold access |
+| `workload_rubrik_cassandra_uniform_p50load` | uniform | 20 | 500 | P50 traffic level |
+| `workload_rubrik_cassandra_uniform_p75load` | uniform | 40 | 1000 | P75 traffic level |
+
+### 6. Multi-node key cardinality (HLL merge)
+
+The Cassandra driver tracks unique keys per node using HyperLogLog sketches.
+After a run completes on each node, it writes `hll_sketch_<timestamp>.bin`.
+Collect these and merge to get cluster-wide cardinality:
+
+```bash
+# Collect sketch files from each node
+scp -i $PEM ubuntu@<node1>:~/hll_sketch_*.bin node1.bin
+scp -i $PEM ubuntu@<node2>:~/hll_sketch_*.bin node2.bin
+scp -i $PEM ubuntu@<node3>:~/hll_sketch_*.bin node3.bin
+
+# Merge
+./hll-merge node1.bin node2.bin node3.bin
+```

@@ -1,0 +1,44 @@
+# Rubrik Cassandra (cqlproxy) YCSB workload — RUN phase (UNIFORM, P75 LOAD)
+# Issues mixed CQL queries against cqlproxy (port 27577).
+# Exercises full stack: cqlproxy translation + CockroachDB execution.
+#
+# P75 LOAD variant: targets 1000 QPS additional on top of steady-state (~227 QPS).
+# Used to simulate P75 CCES cluster traffic levels.
+#
+# Operation mix:
+#   75% SELECT (point lookup), 20% SCAN (range, 10-100 rows), 2% INSERT, 2% UPDATE, 1% DELETE
+#
+# Distribution: Uniform — every key equally likely. Worst case for cache.
+
+workload=core
+
+# Key space must match recordcount used in the load phase
+recordcount=15000000
+operationcount=20000000
+
+# 40 threads, 1000 QPS target — P75 load level
+threadcount=40
+target=1000
+
+# Operation mix matching production
+readproportion=0.75
+scanproportion=0.20
+insertproportion=0.02
+updateproportion=0.02
+deleteproportion=0.01
+
+# Uniform: every key equally likely — maximum cache pressure
+requestdistribution=uniform
+
+# Scan size: uniform between 10 and 100 rows per scan
+maxscanlength=100
+minscanlength=10
+scanlengthdistribution=uniform
+
+measurementtype=histogram
+
+cassandra.hosts=127.0.0.1
+cassandra.port=27577
+cassandra.load_mode=false
+cassandra.username=rksupport
+# cassandra.password must be set per-node: cat /var/lib/rubrik/certs/cql_creds/rksupport

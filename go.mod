@@ -6,6 +6,7 @@ require (
 	github.com/XiaoMi/pegasus-go-client v0.0.0-20181029071519-9400942c5d1c
 	github.com/aerospike/aerospike-client-go v1.35.2
 	github.com/apple/foundationdb/bindings/go v0.0.0-20200112054404-407dc0907f4f
+	github.com/axiomhq/hyperloglog v0.2.0
 	github.com/boltdb/bolt v1.3.1
 	github.com/cenkalti/backoff/v4 v4.1.3
 	github.com/chzyer/readline v0.0.0-20180603132655-2972be24d48e
@@ -20,7 +21,7 @@ require (
 	github.com/go-ini/ini v1.49.0 // indirect
 	github.com/go-redis/redis/v9 v9.0.0-rc.1
 	github.com/go-sql-driver/mysql v1.6.0
-	github.com/gocql/gocql v0.0.0-20181124151448-70385f88b28b
+	github.com/gocql/gocql v1.6.0
 	github.com/lib/pq v1.1.1
 	github.com/magiconair/properties v1.8.0
 	github.com/mattn/go-sqlite3 v2.0.1+incompatible
@@ -46,6 +47,8 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/dynamodb/expression v1.4.26
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.17.1
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.27.0
+	github.com/scaledata/gocql v0.0.0-20250930201118-e0dbb4f6335f
+	github.com/twmb/murmur3 v1.1.3
 	go.etcd.io/etcd/client/pkg/v3 v3.5.2
 	go.etcd.io/etcd/client/v3 v3.5.2
 	go.sia.tech/gofakes3 v0.0.1
@@ -78,8 +81,6 @@ require (
 	github.com/aws/smithy-go v1.13.3 // indirect
 	github.com/benbjohnson/clock v1.1.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/bitly/go-hostpool v0.0.0-20171023180738-a3a6125de932 // indirect
-	github.com/bmizerany/assert v0.0.0-20160611221934-b7ed37b82869 // indirect
 	github.com/census-instrumentation/opencensus-proto v0.4.1 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/chzyer/test v1.0.0 // indirect
@@ -89,6 +90,7 @@ require (
 	github.com/coreos/go-systemd/v22 v22.3.2 // indirect
 	github.com/cznic/mathutil v0.0.0-20181122101859-297441e03548 // indirect
 	github.com/dgryski/go-farm v0.0.0-20190423205320-6a90982ecee2 // indirect
+	github.com/dgryski/go-metro v0.0.0-20180109044635-280f6062b5bc // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/elastic/elastic-transport-go/v8 v8.0.0-20211216131617-bbee439d559c // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
@@ -123,9 +125,9 @@ require (
 	github.com/smartystreets/goconvey v0.0.0-20190330032615-68dc04aab96a // indirect
 	github.com/spf13/pflag v1.0.3 // indirect
 	github.com/stathat/consistent v1.0.0 // indirect
+	github.com/stretchr/testify v1.10.0 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
 	github.com/tikv/pd/client v0.0.0-20220307081149-841fa61e9710 // indirect
-	github.com/twmb/murmur3 v1.1.3 // indirect
 	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
 	github.com/xdg-go/scram v1.1.1 // indirect
 	github.com/xdg-go/stringprep v1.0.3 // indirect
@@ -157,4 +159,6 @@ require (
 
 replace github.com/apache/thrift => github.com/apache/thrift v0.0.0-20171203172758-327ebb6c2b6d
 
-go 1.18
+// replace github.com/gocql/gocql => github.com/scaledata/gocql v0.0.0-20260204120934-55dceabe0e6d
+
+go 1.24.7
